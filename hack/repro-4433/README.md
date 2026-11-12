@@ -122,6 +122,46 @@ At the switch the controller logs `Service transaction (...) not verified: 0/8 e
 second, `verified: 8 endpoints registered` and the final weight shift (`New weights: ... Canary ... Weight:0`), while
 the stable target group still reports `8 initial`.
 
+## Expected results
+
+Measured on 2026-11-12, back to back on the same k3d cluster, Floci, shim and settings (`--aws-verify-target-group`,
+default `ADMIT_CHECKS`), one run each:
+
+| | master | patched (promotion health gate) |
+|---|---|---|
+| controller built from | `9962f9327` | `57ca1627e` |
+| run tag | `run-133813` | `run-133950` |
+| assert exit code | `1` (FAIL) | `0` (PASS) |
+| 5xx after the stable selector switch | 1424 of 3335 requests | 0 of 3016 requests |
+| 5xx window after the switch | 11 s (12:39:07 .. 12:39:17 UTC) | none |
+| final weight shift held | no (same second as the switch) | 10 s (12:40:45 .. 12:40:55 UTC) |
+| canary-start 5xx (first `setWeight`, out of scope) | 113 | 140 |
+
+Earlier master runs give the same picture: `run-131146`, `run-131450`, `run-131913` (master `9962f9327` plus the test-only commit `8f9c7ee96`) failed
+with 1447, 1408 and 1416 5xx over 10 to 11 s after the switch.
+
+On the patched build, at the stable selector switch the controller logs
+`Service transaction (TargetGroup ...) not verified: 0/8 endpoints healthy` (a `TargetGroupUnverified` Warning),
+`Holding final weight shift for stable target group health: keeping canary weight 100` and
+`rollout enqueue due to promotion health gate`. About 10 s later it logs `verified: 8 endpoints healthy`
+(`TargetGroupVerified`), then the final weight shift (`PatchingALBIngress` to desiredWeight `0`). The sampler
+shows the hold:
+
+```
+12:40:45.784 | w S0/C100   | S-TG[8initial                ] C-TG[8healthy                ] | Healthy step2 stable=cc554667b           | 200=168
+...
+12:40:54.085 | w S0/C100   | S-TG[8initial                ] C-TG[8healthy                ] | Healthy step2 stable=cc554667b           | 200=224
+12:40:55.509 | w S100/C0   | S-TG[8healthy                ] C-TG[8healthy                ] | Healthy step2 stable=cc554667b           | 200=280
+```
+
+The Rollout already reports `Healthy` during the hold, so on the patched build `rollout Healthy` in the assert output
+is the switch time, not the end of the hold. Client-go's event spam filter keeps the hold's Warning on the Rollout
+(count 2) but drops the events that end the hold in this run (`TargetGroupVerified ... 8 endpoints healthy`,
+`PatchingALBIngress`). The controller log has every event, in order.
+
+The canary-start 5xx are there on both builds by design. Target admission time is modelled by `elb-shim.py`; the call
+ordering of the LBC and of Argo Rollouts is real.
+
 ## Logs
 
 Each run leaves, in the work dir: `sampler-<tag>.log`, `traffic-<tag>.log`, `lbc-<tag>.log` (LBC log since the
@@ -164,7 +204,8 @@ To watch a run live, start `hack/repro-4433/collector.sh > /tmp/rollouts-4433-lb
   network namespace (`docker run --net container:floci`) with `Host: <LB_DNS>`.
 - On macOS a bind mount of `/tmp` into a container does not show the files: `setup.sh` passes the shim inline. There
   is no `timeout` command, and zsh does not word-split `$VAR`: keep helpers in bash scripts.
-- Target group verification checks registration, not health, and only for `targetType: ip` bindings.
+- On master, target group verification checks registration, not health, and only for `targetType: ip` bindings. The
+  promotion health gate also checks health.
 
 ## Cleanup
 
