@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: repro-4433, labels: {elbv2.k8s.aws/pod-readiness-gate-inject: enabled}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: transaction-root, namespace: repro-4433}
+spec:
+  ports: [{port: 80, targetPort: 8080, protocol: TCP, name: http}]
+  selector: {app: transaction}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: transaction, namespace: repro-4433}
+spec:
+  ports: [{port: 80, targetPort: 8080, protocol: TCP, name: http}]
+  selector: {app: transaction}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: transaction-canary, namespace: repro-4433}
+spec:
+  ports: [{port: 80, targetPort: 8080, protocol: TCP, name: http}]
+  selector: {app: transaction}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: transaction
+  namespace: repro-4433
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/subnets: __SUBNETS__
+    alb.ingress.kubernetes.io/security-groups: __SG__
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "false"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "5"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "2"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+spec:
+  ingressClassName: alb
+  rules:
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: transaction-root
+            port: {name: use-annotation}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: transaction
+  namespace: repro-4433
+  labels:
+    argo-rollouts.argoproj.io/controller-instance-id: repro4433
+spec:
+  replicas: 8
+  selector:
+    matchLabels: {app: transaction}
+  template:
+    metadata:
+      labels: {app: transaction}
+    spec:
+      containers:
+      - name: app
+        image: argoproj/rollouts-demo:blue
+        ports: [{name: http, containerPort: 8080}]
+        resources: {requests: {cpu: 5m, memory: 16Mi}}
+  strategy:
+    canary:
+      stableService: transaction
+      canaryService: transaction-canary
+      trafficRouting:
+        alb:
+          ingress: transaction
+          rootService: transaction-root
+          servicePort: 80
+      steps:
+      - setWeight: 10
+      - pause: {duration: 20s}
