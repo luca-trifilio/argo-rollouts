@@ -261,6 +261,58 @@ point to the new ReplicaSet, the TargetGroup IP verification feature allows the 
 the scale down of the old ReplicaSet until it verifies the Pods IP behind the stableService
 TargetGroup are accurate.
 
+##### Promotion health gate (canary)
+
+At the end of the canary steps, promotion switches the `canary.stableService` selector to the new
+ReplicaSet and then returns all traffic to the stable service (the final weight shift, canary weight
+back to 0). The AWS LoadBalancer controller registers the new Pod IPs in the stable TargetGroup
+asynchronously, and they start in the `initial` health state. Health checks run per TargetGroup, so
+the pods being healthy in the canary TargetGroup does not carry over. If the final weight shift
+happens before the new targets are healthy, the ALB has no healthy target in the stable TargetGroup
+and returns HTTP 503s until the health checks pass.
+
+When TargetGroup verification is enabled, the controller holds the final weight shift after a
+normal end-of-steps promotion: the canary service keeps 100% of the traffic, served by the same new
+pods, until every endpoint of the new stable ReplicaSet is registered **and** reports `healthy` in
+every TargetGroup bound to the stable service. Every other target health state (`initial`,
+`unhealthy`, `draining`, `unused`, `unavailable`) holds the shift. The shift is also held until the
+stable service's `Endpoints` list only the pods of the new ReplicaSet, which can lag a few moments
+behind the selector switch (`TargetGroupUnverified` Warning event
+`Service stable not verified: 0/3 endpoints are pods of ReplicaSet ...`). While held, the
+controller emits a `TargetGroupUnverified` Warning event such as
+`Service stable (TargetGroup arn:...) not verified: 1/3 endpoints healthy`, logs the unhealthy
+targets, and checks again after the verify retry interval (10 seconds by default). Once the
+targets are healthy, it emits a `TargetGroupVerified` event, applies the final weight shift, and
+the update completes as before. The previous stable ReplicaSet is not scaled down while the shift
+is held.
+
+The gate requires:
+
+- the `--aws-verify-target-group` flag (see Usage below);
+- a `TargetGroupBinding` for the stable service, with `targetType: ip`;
+- the `elasticloadbalancing:DescribeTargetHealth` permission (included in the permissions listed
+  under Usage below).
+
+Without them, or with ping-pong, the gate does nothing and the final weight shift happens right
+after the selector switch.
+
+!!! warning
+
+    The gate has no timeout. If the stable TargetGroup never becomes healthy (for example a wrong
+    health check path or a security group blocking the health checks), the rollout keeps holding
+    100% of the traffic on the canary service and keeps emitting `TargetGroupUnverified` Warning
+    events, until the TargetGroup is fixed. The rollout is not marked Degraded and no status message
+    is set: watch the events and the controller logs.
+
+The gate only applies when the canary is at the max weight when promotion happens. It does not
+cover these cases, which can still return 503s:
+
+- full promotion (`kubectl argo rollouts promote --full`), when the canary is below the max weight;
+- rollouts with no steps;
+- fast rollback to a previous ReplicaSet;
+- the first `setWeight` step at the start of an update, when the new pods join the canary
+  TargetGroup.
+
 #### TargetGroup Weight Verification
 
 !!! note
