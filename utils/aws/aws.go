@@ -310,15 +310,8 @@ func toTargetGroupBinding(obj map[string]any) (*TargetGroupBinding, error) {
 // and/or the Service's targetPort is a string and not a number
 // Returns 0 if unable to find matching port in given service.
 func getNumericTargetPort(tgb TargetGroupBinding, svc corev1.Service, endpoints corev1.Endpoints) int32 {
-	var servicePortNum int32
-	var servicePortName string
-	if portInt := tgb.Spec.ServiceRef.Port.IntVal; portInt > 0 {
-		servicePortNum = portInt
-	} else {
-		servicePortName = tgb.Spec.ServiceRef.Port.String()
-	}
 	for _, svcPort := range svc.Spec.Ports {
-		if (servicePortName != "" && servicePortName == svcPort.Name) || (servicePortNum > 0 && servicePortNum == svcPort.Port) {
+		if servicePortMatches(tgb, svcPort) {
 			if targetPortNum := svcPort.TargetPort.IntVal; targetPortNum > 0 {
 				return targetPortNum
 			}
@@ -334,6 +327,28 @@ func getNumericTargetPort(tgb TargetGroupBinding, svc corev1.Service, endpoints 
 		}
 	}
 	return 0
+}
+
+// servicePortMatches returns whether the TargetGroupBinding's spec.serviceRef.port refers to the
+// given Service port, by port number or by port name
+func servicePortMatches(tgb TargetGroupBinding, svcPort corev1.ServicePort) bool {
+	if portInt := tgb.Spec.ServiceRef.Port.IntVal; portInt > 0 {
+		return portInt == svcPort.Port
+	}
+	servicePortName := tgb.Spec.ServiceRef.Port.String()
+	return servicePortName != "" && servicePortName == svcPort.Name
+}
+
+// MatchesServicePort returns whether the TargetGroupBinding's spec.serviceRef.port refers to one of
+// the Service's spec.ports, with the port matching rule of target group verification. Target group
+// verification is not applicable to a binding which matches no Service port.
+func MatchesServicePort(tgb TargetGroupBinding, svc corev1.Service) bool {
+	for _, svcPort := range svc.Spec.Ports {
+		if servicePortMatches(tgb, svcPort) {
+			return true
+		}
+	}
+	return false
 }
 
 // TargetGroupVerifyResult returns metadata when a target group is verified.

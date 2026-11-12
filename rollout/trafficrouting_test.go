@@ -2746,6 +2746,34 @@ func TestCanaryALBPromotionHealthGateNotApplicable(t *testing.T) {
 			},
 		},
 		{
+			// dynamic rollback to stable: the rollout spec went back to the stable ReplicaSet (rs2
+			// here) while the max weight was on an abandoned canary ReplicaSet (rs1 here, already
+			// scaled down). The recorded stable hash is already the stable one, so there is no
+			// pending final weight shift to hold
+			name: "DynamicRollbackToStable",
+			setup: func(g *promotionHealthGateTest) {
+				g.ro.Status.Canary.Weights.Canary.PodTemplateHash = g.rs1PodHash()
+				g.ro.Status.Canary.Weights.Stable.PodTemplateHash = g.rs2PodHash()
+			},
+		},
+		{
+			// an ip mode binding whose port matches no stable service port has nothing to verify,
+			// so the stale Endpoints guard does not hold the gate
+			name: "UnmatchedPortWithStaleEndpoints",
+			setup: func(g *promotionHealthGateTest) {
+				g.tgbs = []*unstructured.Unstructured{newUnmatchedPortTargetGroupBinding(g.t, "stable")}
+				g.endpoints = newEndpoints("stable", "10.0.0.1", "10.0.0.2", "10.0.0.3")
+				g.pods = append(g.pods, newPodsForReplicaSet(g.rs1, "10.0.0.1", "10.0.0.2", "10.0.0.3")...)
+			},
+		},
+		{
+			name: "UnmatchedPortWithEmptyEndpoints",
+			setup: func(g *promotionHealthGateTest) {
+				g.tgbs = []*unstructured.Unstructured{newUnmatchedPortTargetGroupBinding(g.t, "stable")}
+				g.endpoints = newEndpoints("stable")
+			},
+		},
+		{
 			name:  "NilRecordedWeights",
 			setup: func(g *promotionHealthGateTest) { g.ro.Status.Canary.Weights = nil },
 		},
@@ -2771,6 +2799,10 @@ func TestCanaryALBPromotionHealthGateNotApplicable(t *testing.T) {
 
 			g.assertFinalWeightShift(ro)
 			g.fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
+			for _, event := range g.events {
+				assert.NotContains(t, event, conditions.TargetGroupUnverifiedReason)
+				assert.NotContains(t, event, conditions.TargetGroupVerifyErrorReason)
+			}
 		})
 	}
 

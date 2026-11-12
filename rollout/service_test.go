@@ -923,6 +923,15 @@ spec:
 `, name, svcName, arn, targetType))
 }
 
+// newUnmatchedPortTargetGroupBinding returns an ip mode TargetGroupBinding for the given service
+// whose spec.serviceRef.port (8443) matches none of the service's ports (80)
+func newUnmatchedPortTargetGroupBinding(t *testing.T, svcName string) *unstructured.Unstructured {
+	t.Helper()
+	tgb := newTargetGroupBindingFor(svcName, svcName, "arn::1234", "ip")
+	require.NoError(t, unstructured.SetNestedField(tgb.Object, int64(8443), "spec", "serviceRef", "port"))
+	return tgb
+}
+
 // newTargetHealthOutput returns a DescribeTargetHealth output where every given IP is registered
 // on port 80 with the given health state
 func newTargetHealthOutput(state elbv2types.TargetHealthStateEnum, ips ...string) *elbv2.DescribeTargetHealthOutput {
@@ -1175,6 +1184,35 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 
 	t.Run("InstanceTargetTypeIsNotApplicable", func(t *testing.T) {
 		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBindingFor("stable", "stable", "arn::1234", "instance"))
+
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
+		assert.NoError(t, err)
+		assert.Equal(t, targetGroupVerdictNotApplicable, verdict)
+		fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
+		assert.Nil(t, recordedEventMessages(roCtx))
+		assert.Nil(t, roCtx.targetsVerified)
+	})
+
+	// an ip mode binding whose port matches no Service port has nothing to verify, so the stale
+	// Endpoints guard does not hold it, whatever the Endpoints list
+	t.Run("UnmatchedPortWithStaleEndpointsIsNotApplicable", func(t *testing.T) {
+		fakeELB, roCtx, svc, rs := setup(t, newUnmatchedPortTargetGroupBinding(t, "stable"))
+		// 2.4.6.8 is still listed in the Endpoints, but it is not a pod of rs
+		err := roCtx.kubeclientset.CoreV1().Pods(metav1.NamespaceDefault).Delete(context.Background(), rs.Name+"-2", metav1.DeleteOptions{})
+		require.NoError(t, err)
+
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
+		assert.NoError(t, err)
+		assert.Equal(t, targetGroupVerdictNotApplicable, verdict)
+		fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
+		assert.Nil(t, recordedEventMessages(roCtx))
+		assert.Nil(t, roCtx.targetsVerified)
+	})
+
+	t.Run("UnmatchedPortWithEmptyEndpointsIsNotApplicable", func(t *testing.T) {
+		fakeELB, roCtx, svc, rs := setup(t, newUnmatchedPortTargetGroupBinding(t, "stable"))
+		_, err := roCtx.kubeclientset.CoreV1().Endpoints(metav1.NamespaceDefault).Update(context.Background(), newEndpoints("stable"), metav1.UpdateOptions{})
+		require.NoError(t, err)
 
 		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)

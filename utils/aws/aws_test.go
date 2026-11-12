@@ -651,3 +651,19 @@ func TestIsTargetTypeIP(t *testing.T) {
 	assert.False(t, IsTargetTypeIP(TargetGroupBinding{Spec: TargetGroupBindingSpec{TargetType: (*TargetType)(ptr.To[string]("instance"))}}))
 	assert.False(t, IsTargetTypeIP(TargetGroupBinding{}))
 }
+
+func TestMatchesServicePort(t *testing.T) {
+	svc := corev1.Service{
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromString("web")}},
+		},
+	}
+	tgbWithPort := func(port intstr.IntOrString) TargetGroupBinding {
+		return TargetGroupBinding{Spec: TargetGroupBindingSpec{ServiceRef: ServiceReference{Port: port}}}
+	}
+	assert.True(t, MatchesServicePort(tgbWithPort(intstr.FromInt(80)), svc))
+	assert.True(t, MatchesServicePort(tgbWithPort(intstr.FromString("http")), svc))
+	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromInt(8443)), svc))
+	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromString("https")), svc))
+	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromString("")), svc))
+}

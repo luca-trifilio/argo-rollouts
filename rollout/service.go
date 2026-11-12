@@ -218,7 +218,10 @@ const (
 // endpoints controller catches up, and those pods are already registered and healthy. So while the
 // Endpoints are empty, or list an address that is not a pod of rs, the Endpoints do not reflect rs
 // yet: the verdict is targetGroupVerdictNotReady, without calling AWS. It emits a
-// TargetGroupUnverified Warning event with the "x/y endpoints are pods of ReplicaSet" count.
+// TargetGroupUnverified Warning event with the "x/y endpoints are pods of ReplicaSet" count. This
+// guard only runs once the verification is known to apply: when it does not (see
+// targetGroupVerdictNotApplicable), the verdict is targetGroupVerdictNotApplicable, with no event
+// and no AWS call, whatever the Endpoints list.
 //
 // Unlike awsVerifyTargetGroups, it returns its verdict to the caller and never writes
 // c.targetsVerified, which the old ReplicaSet scale down reads with registration-only semantics.
@@ -243,14 +246,16 @@ func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service, rs *a
 	if err != nil {
 		return targetGroupVerdictNotReady, err
 	}
+	// applicability is decided before the Endpoints are read, so that a Service with nothing to
+	// verify is never held by the stale Endpoints guard below
 	var tgBindings []aws.TargetGroupBinding
 	for _, tgb := range allBindings {
-		if aws.IsTargetTypeIP(tgb) {
+		if aws.IsTargetTypeIP(tgb) && aws.MatchesServicePort(tgb, *svc) {
 			tgBindings = append(tgBindings, tgb)
 		}
 	}
 	if len(tgBindings) == 0 {
-		// no ip mode TargetGroupBinding for the service found. nothing to verify
+		// no ip mode TargetGroupBinding matching a port of the service found. nothing to verify
 		return targetGroupVerdictNotApplicable, nil
 	}
 	logCtx.Infof("Verifying target group registration and health")
@@ -275,7 +280,8 @@ func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service, rs *a
 			return targetGroupVerdictNotReady, err
 		}
 		if verifyRes == nil {
-			// verification not applicable (e.g. unmatched port)
+			// verification not applicable (e.g. the Service's named targetPort is not in the
+			// Endpoints)
 			continue
 		}
 		if !verifyRes.Verified {
