@@ -172,10 +172,14 @@ const (
 	TargetGroupVerifiedReason              = "TargetGroupVerified"
 	TargetGroupVerifiedRegistrationMessage = "Service %s (TargetGroup %s) verified: %d endpoints registered"
 	TargetGroupVerifiedWeightsMessage      = "Service %s (TargetGroup %s) verified: canary weight %d set"
+	TargetGroupVerifiedHealthMessage       = "Service %s (TargetGroup %s) verified: %d endpoints healthy"
 	// TargetGroupHealthyReason is emitted when target group has not been verified
 	TargetGroupUnverifiedReason              = "TargetGroupUnverified"
 	TargetGroupUnverifiedRegistrationMessage = "Service %s (TargetGroup %s) not verified: %d/%d endpoints registered"
+	TargetGroupUnverifiedHealthMessage       = "Service %s (TargetGroup %s) not verified: %d/%d endpoints healthy"
 	TargetGroupUnverifiedWeightsMessage      = "Service %s (TargetGroup %s) not verified: canary weight %d not yet set (current: %d)"
+	// TargetGroupUnverifiedEndpointsMessage is emitted when the Endpoints of a Service do not list only the pods of the expected ReplicaSet yet
+	TargetGroupUnverifiedEndpointsMessage = "Service %s not verified: %d/%d endpoints are pods of ReplicaSet %s"
 	// TargetGroupVerifyErrorReason is emitted when we fail to verify the health of a target group due to error
 	TargetGroupVerifyErrorReason  = "TargetGroupVerifyError"
 	TargetGroupVerifyErrorMessage = "Failed to verify Service %s (TargetGroup %s): %s"

@@ -310,15 +310,8 @@ func toTargetGroupBinding(obj map[string]any) (*TargetGroupBinding, error) {
 // and/or the Service's targetPort is a string and not a number
 // Returns 0 if unable to find matching port in given service.
 func getNumericTargetPort(tgb TargetGroupBinding, svc corev1.Service, endpoints corev1.Endpoints) int32 {
-	var servicePortNum int32
-	var servicePortName string
-	if portInt := tgb.Spec.ServiceRef.Port.IntVal; portInt > 0 {
-		servicePortNum = portInt
-	} else {
-		servicePortName = tgb.Spec.ServiceRef.Port.String()
-	}
 	for _, svcPort := range svc.Spec.Ports {
-		if (servicePortName != "" && servicePortName == svcPort.Name) || (servicePortNum > 0 && servicePortNum == svcPort.Port) {
+		if servicePortMatches(tgb, svcPort) {
 			if targetPortNum := svcPort.TargetPort.IntVal; targetPortNum > 0 {
 				return targetPortNum
 			}
@@ -336,22 +329,70 @@ func getNumericTargetPort(tgb TargetGroupBinding, svc corev1.Service, endpoints 
 	return 0
 }
 
+// servicePortMatches returns whether the TargetGroupBinding's spec.serviceRef.port refers to the
+// given Service port, by port number or by port name
+func servicePortMatches(tgb TargetGroupBinding, svcPort corev1.ServicePort) bool {
+	if portInt := tgb.Spec.ServiceRef.Port.IntVal; portInt > 0 {
+		return portInt == svcPort.Port
+	}
+	servicePortName := tgb.Spec.ServiceRef.Port.String()
+	return servicePortName != "" && servicePortName == svcPort.Name
+}
+
+// MatchesServicePort returns whether the TargetGroupBinding's spec.serviceRef.port refers to one of
+// the Service's spec.ports, with the port matching rule of target group verification. Target group
+// verification is not applicable to a binding which matches no Service port.
+func MatchesServicePort(tgb TargetGroupBinding, svc corev1.Service) bool {
+	for _, svcPort := range svc.Spec.Ports {
+		if servicePortMatches(tgb, svcPort) {
+			return true
+		}
+	}
+	return false
+}
+
 // TargetGroupVerifyResult returns metadata when a target group is verified.
 type TargetGroupVerifyResult struct {
 	Service             string
 	Verified            bool
 	EndpointsRegistered int
-	EndpointsTotal      int
+	// EndpointsHealthy is the number of endpoints which are registered and report the `healthy`
+	// target health state. It is reported in both modes, but only decides Verified in the
+	// health-aware mode (VerifyTargetGroupBindingHealthy).
+	EndpointsHealthy int
+	EndpointsTotal   int
+}
+
+// IsTargetTypeIP returns whether the TargetGroupBinding registers pod IPs (spec.targetType: ip),
+// the only target type for which target group verification is applicable.
+func IsTargetTypeIP(tgb TargetGroupBinding) bool {
+	return tgb.Spec.TargetType != nil && *tgb.Spec.TargetType == TargetTypeIP
 }
 
 // VerifyTargetGroupBinding verifies if the underlying AWS TargetGroup has all Pod IPs and ports
 // from the given service (the K8s Endpoints list) registered to the TargetGroup.
-// NOTE: a previous version of this method used to additionally verify that all registered targets
-// were "healthy" (in addition to registered), but the health of registered targets is actually
-// irrelevant for our purposes of verifying the service label change was reflected in the LB.
+// This is registration-only verification: the health of registered targets is ignored, because
+// it is irrelevant for verifying that the service label change was reflected in the LB (blue-green
+// promotion, canary old ReplicaSet scale down). Use VerifyTargetGroupBindingHealthy when the
+// targets must also be able to take traffic.
 // Returns nil if the verification is not applicable (e.g. target type is not IP)
 func VerifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Client, tgb TargetGroupBinding, endpoints *corev1.Endpoints, svc *corev1.Service) (*TargetGroupVerifyResult, error) {
-	if tgb.Spec.TargetType == nil || *tgb.Spec.TargetType != TargetTypeIP {
+	return verifyTargetGroupBinding(ctx, logCtx, awsClnt, tgb, endpoints, svc, false)
+}
+
+// VerifyTargetGroupBindingHealthy is the health-aware mode of VerifyTargetGroupBinding: it
+// verifies that every Pod IP and port of the given service (the K8s Endpoints list) is registered
+// to the underlying AWS TargetGroup and reports the `healthy` target health state. Every other
+// state (`initial`, `unhealthy`, `unhealthy.draining`, `draining`, `unused`, `unavailable`) counts
+// as not healthy. Health checks are always enabled for `ip` target groups, so there is no
+// "health checks disabled" exception. Targets which are not endpoints of the service are ignored.
+// Returns nil if the verification is not applicable (e.g. target type is not IP)
+func VerifyTargetGroupBindingHealthy(ctx context.Context, logCtx *log.Entry, awsClnt Client, tgb TargetGroupBinding, endpoints *corev1.Endpoints, svc *corev1.Service) (*TargetGroupVerifyResult, error) {
+	return verifyTargetGroupBinding(ctx, logCtx, awsClnt, tgb, endpoints, svc, true)
+}
+
+func verifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Client, tgb TargetGroupBinding, endpoints *corev1.Endpoints, svc *corev1.Service, requireHealthy bool) (*TargetGroupVerifyResult, error) {
+	if !IsTargetTypeIP(tgb) {
 		// We only need to verify target groups using AWS CNI (spec.targetType: ip)
 		return nil, nil
 	}
@@ -383,6 +424,8 @@ func VerifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Cl
 	var ignored []string
 	var verified []string
 	var unverified []string
+	var unhealthy []string
+	healthy := 0
 
 	// Iterate all registered targets in AWS TargetGroup. Mark all endpoint IPs which we see registered
 	for _, target := range targets {
@@ -398,15 +441,21 @@ func VerifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Cl
 			continue
 		}
 		// Verify we see the endpoint IP registered to the TargetGroup
-		// NOTE: we used to check health here, but health is not relevant for verifying service label change
 		endpointIPs[targetStr] = true
 		verified = append(verified, targetStr)
+		// Only the `healthy` state counts as healthy
+		if target.TargetHealth != nil && target.TargetHealth.State == elbv2types.TargetHealthStateEnumHealthy {
+			healthy++
+		} else {
+			unhealthy = append(unhealthy, describeTargetHealth(targetStr, target.TargetHealth))
+		}
 	}
 
 	tgvr := TargetGroupVerifyResult{
 		Service:             svc.Name,
 		EndpointsTotal:      len(endpointIPs),
 		EndpointsRegistered: len(verified),
+		EndpointsHealthy:    healthy,
 	}
 
 	// Check if any of our desired endpoints are not yet registered
@@ -420,6 +469,23 @@ func VerifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Cl
 	logCtx.Infof("Verified targets: %s", strings.Join(verified, ", "))
 	logCtx.Infof("Unregistered targets: %s", strings.Join(unverified, ", "))
 
+	if requireHealthy {
+		logCtx.Infof("Unhealthy targets: %s", strings.Join(unhealthy, ", "))
+		tgvr.Verified = tgvr.EndpointsHealthy == tgvr.EndpointsTotal
+		return &tgvr, nil
+	}
 	tgvr.Verified = bool(tgvr.EndpointsRegistered == tgvr.EndpointsTotal)
 	return &tgvr, nil
+}
+
+// describeTargetHealth formats a registered target with its health state and reason for logging,
+// e.g. "1.2.3.4:80 (initial: Elb.RegistrationInProgress)"
+func describeTargetHealth(targetStr string, health *elbv2types.TargetHealth) string {
+	if health == nil {
+		return fmt.Sprintf("%s (unknown)", targetStr)
+	}
+	if health.Reason == "" {
+		return fmt.Sprintf("%s (%s)", targetStr, health.State)
+	}
+	return fmt.Sprintf("%s (%s: %s)", targetStr, health.State, health.Reason)
 }

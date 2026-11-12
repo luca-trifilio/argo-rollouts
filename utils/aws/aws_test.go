@@ -405,3 +405,265 @@ func TestVerifyTargetGroupBinding(t *testing.T) {
 	assert.Equal(t, expectedRes, *res)
 	assert.NoError(t, err)
 }
+
+// healthTestTarget is a registered target with the given health state, for health-aware tests
+type healthTestTarget struct {
+	ip    string
+	port  int32
+	state elbv2types.TargetHealthStateEnum
+}
+
+func newHealthTestFixtures(endpointIPs ...string) (TargetGroupBinding, corev1.Endpoints, corev1.Service) {
+	tgb := TargetGroupBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stable",
+			Namespace: metav1.NamespaceDefault,
+		},
+		Spec: TargetGroupBindingSpec{
+			TargetType:     (*TargetType)(ptr.To[string]("ip")),
+			TargetGroupARN: "arn::1234",
+			ServiceRef: ServiceReference{
+				Name: "stable",
+				Port: intstr.FromInt(80),
+			},
+		},
+	}
+	var addresses []corev1.EndpointAddress
+	for _, ip := range endpointIPs {
+		addresses = append(addresses, corev1.EndpointAddress{IP: ip})
+	}
+	ep := corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stable",
+			Namespace: metav1.NamespaceDefault,
+		},
+		Subsets: []corev1.EndpointSubset{{
+			Addresses: addresses,
+			Ports:     []corev1.EndpointPort{{Port: 8080, Protocol: "TCP"}},
+		}},
+	}
+	svc := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stable",
+			Namespace: metav1.NamespaceDefault,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{},
+			Ports: []corev1.ServicePort{{
+				Protocol:   "TCP",
+				Port:       int32(80),
+				TargetPort: intstr.FromInt(8080),
+			}},
+		},
+	}
+	return tgb, ep, svc
+}
+
+func newFakeClientWithTargets(targets ...healthTestTarget) Client {
+	thOut := elbv2.DescribeTargetHealthOutput{}
+	for _, target := range targets {
+		thOut.TargetHealthDescriptions = append(thOut.TargetHealthDescriptions, elbv2types.TargetHealthDescription{
+			Target: &elbv2types.TargetDescription{
+				Id:   ptr.To[string](target.ip),
+				Port: ptr.To[int32](target.port),
+			},
+			TargetHealth: &elbv2types.TargetHealth{
+				State: target.state,
+			},
+		})
+	}
+	fakeELB, awsClnt := newFakeClient()
+	fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(&thOut, nil)
+	return awsClnt
+}
+
+func TestVerifyTargetGroupBindingHealthy(t *testing.T) {
+	logCtx := log.NewEntry(log.New())
+	endpointIPs := []string{"1.2.3.4", "5.6.7.8", "2.4.6.8"}
+
+	t.Run("RegisteredButInitialIsNotHealthy", func(t *testing.T) {
+		tgb, ep, svc := newHealthTestFixtures(endpointIPs...)
+		targets := []healthTestTarget{
+			{"1.2.3.4", 8080, elbv2types.TargetHealthStateEnumInitial},
+			{"5.6.7.8", 8080, elbv2types.TargetHealthStateEnumInitial},
+			{"2.4.6.8", 8080, elbv2types.TargetHealthStateEnumInitial},
+		}
+
+		res, err := VerifyTargetGroupBindingHealthy(context.TODO(), logCtx, newFakeClientWithTargets(targets...), tgb, &ep, &svc)
+		assert.NoError(t, err)
+		assert.Equal(t, TargetGroupVerifyResult{
+			Service:             "stable",
+			Verified:            false,
+			EndpointsRegistered: 3,
+			EndpointsHealthy:    0,
+			EndpointsTotal:      3,
+		}, *res)
+
+		// registration-only verification on the same input still reports verified
+		res, err = VerifyTargetGroupBinding(context.TODO(), logCtx, newFakeClientWithTargets(targets...), tgb, &ep, &svc)
+		assert.NoError(t, err)
+		assert.True(t, res.Verified)
+		assert.Equal(t, 3, res.EndpointsRegistered)
+		assert.Equal(t, 3, res.EndpointsTotal)
+	})
+
+	t.Run("AllHealthyIsVerified", func(t *testing.T) {
+		tgb, ep, svc := newHealthTestFixtures(endpointIPs...)
+		awsClnt := newFakeClientWithTargets(
+			healthTestTarget{"1.2.3.4", 8080, elbv2types.TargetHealthStateEnumHealthy},
+			healthTestTarget{"5.6.7.8", 8080, elbv2types.TargetHealthStateEnumHealthy},
+			healthTestTarget{"2.4.6.8", 8080, elbv2types.TargetHealthStateEnumHealthy},
+		)
+
+		res, err := VerifyTargetGroupBindingHealthy(context.TODO(), logCtx, awsClnt, tgb, &ep, &svc)
+		assert.NoError(t, err)
+		assert.Equal(t, TargetGroupVerifyResult{
+			Service:             "stable",
+			Verified:            true,
+			EndpointsRegistered: 3,
+			EndpointsHealthy:    3,
+			EndpointsTotal:      3,
+		}, *res)
+	})
+
+	// every state other than `healthy` counts as not healthy, with no exception
+	notHealthyStates := []elbv2types.TargetHealthStateEnum{
+		elbv2types.TargetHealthStateEnumInitial,
+		elbv2types.TargetHealthStateEnumUnhealthy,
+		elbv2types.TargetHealthStateEnumUnhealthyDraining,
+		elbv2types.TargetHealthStateEnumDraining,
+		elbv2types.TargetHealthStateEnumUnused,
+		elbv2types.TargetHealthStateEnumUnavailable,
+	}
+	for _, state := range notHealthyStates {
+		t.Run("OneEndpoint_"+string(state), func(t *testing.T) {
+			tgb, ep, svc := newHealthTestFixtures(endpointIPs...)
+			awsClnt := newFakeClientWithTargets(
+				healthTestTarget{"1.2.3.4", 8080, elbv2types.TargetHealthStateEnumHealthy},
+				healthTestTarget{"5.6.7.8", 8080, elbv2types.TargetHealthStateEnumHealthy},
+				healthTestTarget{"2.4.6.8", 8080, state},
+			)
+
+			res, err := VerifyTargetGroupBindingHealthy(context.TODO(), logCtx, awsClnt, tgb, &ep, &svc)
+			assert.NoError(t, err)
+			assert.False(t, res.Verified)
+			assert.Equal(t, 3, res.EndpointsRegistered)
+			assert.Equal(t, 2, res.EndpointsHealthy)
+			assert.Equal(t, 3, res.EndpointsTotal)
+		})
+	}
+
+	t.Run("MixedStates", func(t *testing.T) {
+		tgb, ep, svc := newHealthTestFixtures("1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4", "5.5.5.5", "6.6.6.6")
+		targets := []healthTestTarget{
+			{"1.1.1.1", 8080, elbv2types.TargetHealthStateEnumHealthy},
+			{"2.2.2.2", 8080, elbv2types.TargetHealthStateEnumInitial},
+			{"3.3.3.3", 8080, elbv2types.TargetHealthStateEnumDraining},
+			{"4.4.4.4", 8080, elbv2types.TargetHealthStateEnumUnhealthy},
+			{"5.5.5.5", 8080, elbv2types.TargetHealthStateEnumUnused},
+			{"6.6.6.6", 8080, elbv2types.TargetHealthStateEnumUnavailable},
+		}
+
+		res, err := VerifyTargetGroupBindingHealthy(context.TODO(), logCtx, newFakeClientWithTargets(targets...), tgb, &ep, &svc)
+		assert.NoError(t, err)
+		assert.Equal(t, TargetGroupVerifyResult{
+			Service:             "stable",
+			Verified:            false,
+			EndpointsRegistered: 6,
+			EndpointsHealthy:    1,
+			EndpointsTotal:      6,
+		}, *res)
+
+		// registration-only verification ignores health
+		res, err = VerifyTargetGroupBinding(context.TODO(), logCtx, newFakeClientWithTargets(targets...), tgb, &ep, &svc)
+		assert.NoError(t, err)
+		assert.True(t, res.Verified)
+		assert.Equal(t, 6, res.EndpointsRegistered)
+		assert.Equal(t, 6, res.EndpointsTotal)
+	})
+
+	t.Run("UnregisteredEndpointIsNotHealthy", func(t *testing.T) {
+		tgb, ep, svc := newHealthTestFixtures(endpointIPs...)
+		awsClnt := newFakeClientWithTargets(
+			healthTestTarget{"1.2.3.4", 8080, elbv2types.TargetHealthStateEnumHealthy},
+			healthTestTarget{"5.6.7.8", 8080, elbv2types.TargetHealthStateEnumHealthy},
+		)
+
+		res, err := VerifyTargetGroupBindingHealthy(context.TODO(), logCtx, awsClnt, tgb, &ep, &svc)
+		assert.NoError(t, err)
+		assert.Equal(t, TargetGroupVerifyResult{
+			Service:             "stable",
+			Verified:            false,
+			EndpointsRegistered: 2,
+			EndpointsHealthy:    2,
+			EndpointsTotal:      3,
+		}, *res)
+	})
+
+	t.Run("NonEndpointTargetsAreIgnored", func(t *testing.T) {
+		tgb, ep, svc := newHealthTestFixtures(endpointIPs...)
+		awsClnt := newFakeClientWithTargets(
+			healthTestTarget{"1.2.3.4", 8080, elbv2types.TargetHealthStateEnumHealthy},
+			healthTestTarget{"5.6.7.8", 8080, elbv2types.TargetHealthStateEnumHealthy},
+			healthTestTarget{"2.4.6.8", 8080, elbv2types.TargetHealthStateEnumHealthy},
+			// old pods being deregistered, not endpoints of the service
+			healthTestTarget{"9.8.7.6", 8080, elbv2types.TargetHealthStateEnumDraining},
+			healthTestTarget{"9.8.7.5", 8080, elbv2types.TargetHealthStateEnumUnhealthy},
+			// endpoint IP on another port
+			healthTestTarget{"2.4.6.8", 8081, elbv2types.TargetHealthStateEnumInitial},
+		)
+
+		res, err := VerifyTargetGroupBindingHealthy(context.TODO(), logCtx, awsClnt, tgb, &ep, &svc)
+		assert.NoError(t, err)
+		assert.Equal(t, TargetGroupVerifyResult{
+			Service:             "stable",
+			Verified:            true,
+			EndpointsRegistered: 3,
+			EndpointsHealthy:    3,
+			EndpointsTotal:      3,
+		}, *res)
+	})
+
+	t.Run("InstanceModeIsNotApplicable", func(t *testing.T) {
+		_, awsClnt := newFakeClient()
+		tgb := TargetGroupBinding{
+			Spec: TargetGroupBindingSpec{
+				TargetType: (*TargetType)(ptr.To[string]("instance")),
+			},
+		}
+		res, err := VerifyTargetGroupBindingHealthy(context.TODO(), logCtx, awsClnt, tgb, nil, nil)
+		assert.Nil(t, res)
+		assert.NoError(t, err)
+	})
+
+	t.Run("UnmatchedPortIsNotApplicable", func(t *testing.T) {
+		tgb, ep, svc := newHealthTestFixtures(endpointIPs...)
+		tgb.Spec.ServiceRef.Port = intstr.FromInt(8443)
+		_, awsClnt := newFakeClient()
+		res, err := VerifyTargetGroupBindingHealthy(context.TODO(), logCtx, awsClnt, tgb, &ep, &svc)
+		assert.Nil(t, res)
+		assert.NoError(t, err)
+	})
+}
+
+func TestIsTargetTypeIP(t *testing.T) {
+	assert.True(t, IsTargetTypeIP(TargetGroupBinding{Spec: TargetGroupBindingSpec{TargetType: (*TargetType)(ptr.To[string]("ip"))}}))
+	assert.False(t, IsTargetTypeIP(TargetGroupBinding{Spec: TargetGroupBindingSpec{TargetType: (*TargetType)(ptr.To[string]("instance"))}}))
+	assert.False(t, IsTargetTypeIP(TargetGroupBinding{}))
+}
+
+func TestMatchesServicePort(t *testing.T) {
+	svc := corev1.Service{
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Name: "http", Port: 80, TargetPort: intstr.FromString("web")}},
+		},
+	}
+	tgbWithPort := func(port intstr.IntOrString) TargetGroupBinding {
+		return TargetGroupBinding{Spec: TargetGroupBindingSpec{ServiceRef: ServiceReference{Port: port}}}
+	}
+	assert.True(t, MatchesServicePort(tgbWithPort(intstr.FromInt(80)), svc))
+	assert.True(t, MatchesServicePort(tgbWithPort(intstr.FromString("http")), svc))
+	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromInt(8443)), svc))
+	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromString("https")), svc))
+	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromString("")), svc))
+}
