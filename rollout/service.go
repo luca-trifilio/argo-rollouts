@@ -7,6 +7,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	patchtypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
@@ -212,6 +213,13 @@ const (
 // a Service and returns whether every endpoint IP:port is registered and reports `healthy` in every
 // target group bound to the Service through an ip mode TargetGroupBinding.
 //
+// Only the endpoints of rs, the ReplicaSet the Service is expected to select, count. Right after a
+// selector switch, the Service's Endpoints still list the pods of the previous ReplicaSet until the
+// endpoints controller catches up, and those pods are already registered and healthy. So while the
+// Endpoints are empty, or list an address that is not a pod of rs, the Endpoints do not reflect rs
+// yet: the verdict is targetGroupVerdictNotReady, without calling AWS. It emits a
+// TargetGroupUnverified Warning event with the "x/y endpoints are pods of ReplicaSet" count.
+//
 // Unlike awsVerifyTargetGroups, it returns its verdict to the caller and never writes
 // c.targetsVerified, which the old ReplicaSet scale down reads with registration-only semantics.
 // It does not requeue the rollout either: that is the caller's decision. It also does not check
@@ -222,7 +230,7 @@ const (
 // group and the "x/y endpoints healthy" count, and stops at the first such target group. The
 // unhealthy targets are logged. On error, it emits a TargetGroupVerifyError Warning event and
 // returns targetGroupVerdictNotReady with the error.
-func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service) (targetGroupVerdict, error) {
+func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service, rs *appsv1.ReplicaSet) (targetGroupVerdict, error) {
 	if !defaults.VerifyTargetGroup() {
 		// feature is disabled
 		return targetGroupVerdictNotApplicable, nil
@@ -251,6 +259,13 @@ func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service) (targ
 	if err != nil {
 		return targetGroupVerdictNotReady, err
 	}
+	reflected, err := c.endpointsReflectReplicaSet(ctx, endpoints, rs)
+	if err != nil {
+		return targetGroupVerdictNotReady, err
+	}
+	if !reflected {
+		return targetGroupVerdictNotReady, nil
+	}
 
 	verdict := targetGroupVerdictNotApplicable
 	for _, tgb := range tgBindings {
@@ -271,6 +286,49 @@ func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service) (targ
 		verdict = targetGroupVerdictReady
 	}
 	return verdict, nil
+}
+
+// endpointsReflectReplicaSet returns whether the Endpoints of a Service list at least one ready
+// address, and only ready addresses of pods of rs, matched by pod IP. The pods are read from the
+// API, like the Endpoints, so that both are as fresh as possible. When they do not, it emits a
+// TargetGroupUnverified Warning event with the "x/y endpoints are pods of ReplicaSet" count.
+func (c *rolloutContext) endpointsReflectReplicaSet(ctx context.Context, endpoints *corev1.Endpoints, rs *appsv1.ReplicaSet) (bool, error) {
+	logCtx := c.log.WithField(logutil.ServiceKey, endpoints.Name)
+	podHash := replicasetutil.GetPodTemplateHash(rs)
+	if podHash == "" {
+		logCtx.Info("Endpoints not verified: no ReplicaSet to match them against")
+		return false, nil
+	}
+	pods, err := c.kubeclientset.CoreV1().Pods(endpoints.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set{v1alpha1.DefaultRolloutUniqueLabelKey: podHash}.String(),
+	})
+	if err != nil {
+		return false, err
+	}
+	rsPodIPs := make(map[string]bool)
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP != "" {
+			rsPodIPs[pod.Status.PodIP] = true
+		}
+		for _, podIP := range pod.Status.PodIPs {
+			rsPodIPs[podIP.IP] = true
+		}
+	}
+	total, ofRS := 0, 0
+	for _, subset := range endpoints.Subsets {
+		for _, addr := range subset.Addresses {
+			total++
+			if rsPodIPs[addr.IP] {
+				ofRS++
+			}
+		}
+	}
+	if total == 0 || ofRS < total {
+		c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: conditions.TargetGroupUnverifiedReason}, conditions.TargetGroupUnverifiedEndpointsMessage, endpoints.Name, ofRS, total, rs.Name)
+		logCtx.Infof("Endpoints do not reflect ReplicaSet '%s' yet: %d/%d endpoints are its pods", rs.Name, ofRS, total)
+		return false, nil
+	}
+	return true, nil
 }
 
 // shouldVerifyTargetGroup returns whether or not we should verify the target group

@@ -1,6 +1,7 @@
 package rollout
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -185,6 +188,29 @@ func newEndpoints(name string, ips ...string) *corev1.Endpoints {
 		ep.Subsets[0].Addresses = append(ep.Subsets[0].Addresses, address)
 	}
 	return &ep
+}
+
+// newPodsForReplicaSet returns one running pod of the given ReplicaSet per given IP, named
+// "<rs name>-<index>" and labeled with the ReplicaSet's pod template hash
+func newPodsForReplicaSet(rs *appsv1.ReplicaSet, ips ...string) []*corev1.Pod {
+	var pods []*corev1.Pod
+	for i, ip := range ips {
+		pods = append(pods, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      fmt.Sprintf("%s-%d", rs.Name, i),
+				Namespace: rs.Namespace,
+				Labels: map[string]string{
+					v1alpha1.DefaultRolloutUniqueLabelKey: rs.Labels[v1alpha1.DefaultRolloutUniqueLabelKey],
+				},
+			},
+			Status: corev1.PodStatus{
+				Phase:  corev1.PodRunning,
+				PodIP:  ip,
+				PodIPs: []corev1.PodIP{{IP: ip}},
+			},
+		})
+	}
+	return pods
 }
 
 func newTargetGroupBinding(name string) *unstructured.Unstructured {
@@ -945,7 +971,13 @@ func newTargetGroupsHealthContext(f *fixture, ro *v1alpha1.Rollout) *rolloutCont
 // recordedEventMessages returns the "<type> <reason> <message>" strings of the events emitted
 // through the rollout context's fake recorder
 func recordedEventMessages(roCtx *rolloutContext) []string {
-	k8sRecorder := roCtx.recorder.(*record.FakeEventRecorder).Recorder.(*k8srecord.FakeRecorder)
+	return fakeRecorderEventMessages(roCtx.recorder)
+}
+
+// fakeRecorderEventMessages returns the "<type> <reason> <message>" strings of the events emitted
+// through a fake event recorder (e.g. a fixture controller's), draining them
+func fakeRecorderEventMessages(recorder record.EventRecorder) []string {
+	k8sRecorder := recorder.(*record.FakeEventRecorder).Recorder.(*k8srecord.FakeRecorder)
 	var events []string
 	for {
 		select {
@@ -961,7 +993,8 @@ func recordedEventMessages(roCtx *rolloutContext) []string {
 func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	endpointIPs := []string{"1.2.3.4", "5.6.7.8", "2.4.6.8"}
 
-	setup := func(t *testing.T, tgbs ...*unstructured.Unstructured) (*mocks.ELBv2APIClient, *rolloutContext, *corev1.Service) {
+	// setup returns a stable service selecting rs, whose Endpoints list the pods of rs
+	setup := func(t *testing.T, tgbs ...*unstructured.Unstructured) (*mocks.ELBv2APIClient, *rolloutContext, *corev1.Service, *appsv1.ReplicaSet) {
 		t.Helper()
 		defaults.SetVerifyTargetGroup(true)
 		t.Cleanup(func() { defaults.SetVerifyTargetGroup(false) })
@@ -972,22 +1005,43 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 		f := newFixture(t)
 		t.Cleanup(f.Close)
 		ro := newALBCanaryRolloutForTargetGroups()
-		svc := newService("stable", 80, map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: "newhash"}, ro)
+		rs := newReplicaSetWithStatus(ro, 3, 3)
+		svc := newService("stable", 80, map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: rs.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]}, ro)
 		ep := newEndpoints("stable", endpointIPs...)
 		f.objects = append(f.objects, ro)
 		for _, tgb := range tgbs {
 			f.objects = append(f.objects, tgb)
 		}
 		f.kubeobjects = append(f.kubeobjects, svc, ep)
-		return fakeELB, newTargetGroupsHealthContext(f, ro), svc
+		for _, pod := range newPodsForReplicaSet(rs, endpointIPs...) {
+			f.kubeobjects = append(f.kubeobjects, pod)
+		}
+		return fakeELB, newTargetGroupsHealthContext(f, ro), svc, rs
 	}
 
+	t.Run("EndpointNotPodOfReplicaSetIsNotReady", func(t *testing.T) {
+		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBinding("stable"))
+		// 2.4.6.8 is still listed in the Endpoints, but it is not a pod of rs (e.g. a pod of the
+		// previous ReplicaSet, before the endpoints controller catches up with a selector switch)
+		err := roCtx.kubeclientset.CoreV1().Pods(metav1.NamespaceDefault).Delete(context.Background(), rs.Name+"-2", metav1.DeleteOptions{})
+		require.NoError(t, err)
+
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
+		assert.NoError(t, err)
+		assert.Equal(t, targetGroupVerdictNotReady, verdict)
+		fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
+		assert.Equal(t, []string{
+			"Warning " + conditions.TargetGroupUnverifiedReason + " Service stable not verified: 2/3 endpoints are pods of ReplicaSet " + rs.Name,
+		}, recordedEventMessages(roCtx))
+		assert.Nil(t, roCtx.targetsVerified)
+	})
+
 	t.Run("RegisteredButInitialIsNotReady", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t, newTargetGroupBinding("stable"))
+		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBinding("stable"))
 		thOut := newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, endpointIPs...)
 		fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(thOut, nil)
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)
 		assert.Equal(t, targetGroupVerdictNotReady, verdict)
 		assert.Equal(t, []string{
@@ -998,11 +1052,11 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	})
 
 	t.Run("RegisteredButInitialIsVerifiedByRegistrationOnly", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t, newTargetGroupBinding("stable"))
+		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBinding("stable"))
 		thOut := newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, endpointIPs...)
 		fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(thOut, nil)
 		// registration-only verification applies to a promoted canary (stableRS == new hash)
-		roCtx.newRS = newReplicaSetWithStatus(roCtx.rollout, 3, 3)
+		roCtx.newRS = rs
 		roCtx.rollout.Status.StableRS = roCtx.newRS.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
 
 		err := roCtx.awsVerifyTargetGroups(svc)
@@ -1014,14 +1068,14 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	})
 
 	t.Run("AllHealthyIsReady", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t, newTargetGroupBinding("stable"))
+		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBinding("stable"))
 		thOut := newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, endpointIPs...)
 		// old pods being deregistered are not endpoints of the service, and are ignored
 		thOut.TargetHealthDescriptions = append(thOut.TargetHealthDescriptions,
 			newTargetHealthOutput(elbv2types.TargetHealthStateEnumDraining, "9.8.7.6", "9.8.7.5").TargetHealthDescriptions...)
 		fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(thOut, nil)
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)
 		assert.Equal(t, targetGroupVerdictReady, verdict)
 		assert.Equal(t, []string{
@@ -1035,13 +1089,13 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 		elbv2types.TargetHealthStateEnumUnavailable,
 	} {
 		t.Run("OneEndpoint_"+string(state)+"_IsNotReady", func(t *testing.T) {
-			fakeELB, roCtx, svc := setup(t, newTargetGroupBinding("stable"))
+			fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBinding("stable"))
 			thOut := newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, "1.2.3.4", "5.6.7.8")
 			thOut.TargetHealthDescriptions = append(thOut.TargetHealthDescriptions,
 				newTargetHealthOutput(state, "2.4.6.8").TargetHealthDescriptions...)
 			fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(thOut, nil)
 
-			verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+			verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 			assert.NoError(t, err)
 			assert.Equal(t, targetGroupVerdictNotReady, verdict)
 			assert.Equal(t, []string{
@@ -1051,11 +1105,11 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	}
 
 	t.Run("UnregisteredEndpointIsNotReady", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t, newTargetGroupBinding("stable"))
+		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBinding("stable"))
 		thOut := newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, "1.2.3.4", "5.6.7.8")
 		fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(thOut, nil)
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)
 		assert.Equal(t, targetGroupVerdictNotReady, verdict)
 		assert.Equal(t, []string{
@@ -1064,7 +1118,7 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	})
 
 	t.Run("TwoTargetGroupBindingsOneNotHealthyIsNotReady", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t,
+		fakeELB, roCtx, svc, rs := setup(t,
 			newTargetGroupBindingFor("stable-a", "stable", "arn::healthy", "ip"),
 			newTargetGroupBindingFor("stable-b", "stable", "arn::initial", "ip"),
 		)
@@ -1075,7 +1129,7 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 			return *in.TargetGroupArn == "arn::initial"
 		})).Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, endpointIPs...), nil)
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)
 		assert.Equal(t, targetGroupVerdictNotReady, verdict)
 		// the bindings may be listed in any order, and the check stops at the first not ready one
@@ -1084,23 +1138,23 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	})
 
 	t.Run("TwoTargetGroupBindingsAllHealthyIsReady", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t,
+		fakeELB, roCtx, svc, rs := setup(t,
 			newTargetGroupBindingFor("stable-a", "stable", "arn::a", "ip"),
 			newTargetGroupBindingFor("stable-b", "stable", "arn::b", "ip"),
 		)
 		fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, endpointIPs...), nil)
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)
 		assert.Equal(t, targetGroupVerdictReady, verdict)
 		fakeELB.AssertNumberOfCalls(t, "DescribeTargetHealth", 2)
 	})
 
 	t.Run("FlagOffIsNotApplicable", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t, newTargetGroupBinding("stable"))
+		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBinding("stable"))
 		defaults.SetVerifyTargetGroup(false)
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)
 		assert.Equal(t, targetGroupVerdictNotApplicable, verdict)
 		fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
@@ -1109,9 +1163,9 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	})
 
 	t.Run("NoTargetGroupBindingIsNotApplicable", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t)
+		fakeELB, roCtx, svc, rs := setup(t)
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)
 		assert.Equal(t, targetGroupVerdictNotApplicable, verdict)
 		fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
@@ -1120,9 +1174,9 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	})
 
 	t.Run("InstanceTargetTypeIsNotApplicable", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t, newTargetGroupBindingFor("stable", "stable", "arn::1234", "instance"))
+		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBindingFor("stable", "stable", "arn::1234", "instance"))
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.NoError(t, err)
 		assert.Equal(t, targetGroupVerdictNotApplicable, verdict)
 		fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
@@ -1131,10 +1185,10 @@ func TestAWSVerifyTargetGroupsHealthy(t *testing.T) {
 	})
 
 	t.Run("DescribeTargetHealthErrorIsNotReady", func(t *testing.T) {
-		fakeELB, roCtx, svc := setup(t, newTargetGroupBinding("stable"))
+		fakeELB, roCtx, svc, rs := setup(t, newTargetGroupBinding("stable"))
 		fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(nil, fmt.Errorf("boom"))
 
-		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc)
+		verdict, err := roCtx.awsVerifyTargetGroupsHealthy(svc, rs)
 		assert.EqualError(t, err, "boom")
 		assert.Equal(t, targetGroupVerdictNotReady, verdict)
 		assert.Equal(t, []string{

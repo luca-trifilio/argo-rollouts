@@ -173,6 +173,15 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 	}
 
 	c.log.Infof("Found %d TrafficRouting Reconcilers", len(reconcilers))
+
+	// The promotion health gate is evaluated once for all reconcilers, since they share the
+	// recorded weights. Returning here, before the weights are recalculated, keeps the old
+	// stable hash in the recorded weights, so the gate is evaluated again on the requeue and the
+	// previous stable ReplicaSet stays referenced (not scaled down).
+	if held, err := c.holdFinalWeightShift(reconcilers); held || err != nil {
+		return err
+	}
+
 	// iterate over the list of trafficReconcilers
 	for _, reconciler := range reconcilers {
 		c.log.Infof("Reconciling TrafficRouting with type '%s'", reconciler.Type())
@@ -353,6 +362,80 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 		}
 	}
 	return nil
+}
+
+// isFinalWeightShiftPending returns whether this is a reconcile after a normal end-of-steps
+// promotion in which the final weight shift has not happened yet, with an ALB traffic router and
+// no ping-pong: the rollout is fully promoted, but the weights recorded by the previous reconcile
+// still send the max weight to the canary service, which selects the new stable ReplicaSet, and
+// record the previous stable ReplicaSet for the stable service. This is when the promotion health
+// gate applies.
+//
+// It reads the recorded weights, not the desired weight of this reconcile (already 0 once fully
+// promoted). The max weight condition keeps the gate off promotions where the canary is below max
+// (full promotion, no steps, fast rollback): holding the weight would not keep traffic off the
+// stable target group there. Initial deploys have no recorded weights, or the canary weight at 0.
+func (c *rolloutContext) isFinalWeightShiftPending(reconcilers []trafficrouting.TrafficRoutingReconciler) bool {
+	if !rolloututil.IsFullyPromoted(c.rollout) || trafficrouting.IsPingPongEnabled(c.rollout) {
+		return false
+	}
+	hasALB := false
+	for _, reconciler := range reconcilers {
+		if reconciler.Type() == alb.Type {
+			hasALB = true
+			break
+		}
+	}
+	if !hasALB {
+		return false
+	}
+	weights := c.rollout.Status.Canary.Weights
+	stableHash := replicasetutil.GetPodTemplateHash(c.stableRS)
+	return weights != nil &&
+		stableHash != "" &&
+		weights.Stable.PodTemplateHash != "" &&
+		weights.Stable.PodTemplateHash != stableHash &&
+		weights.Canary.PodTemplateHash == stableHash &&
+		weights.Canary.Weight == weightutil.MaxTrafficWeight(c.rollout)
+}
+
+// holdFinalWeightShift is the promotion health gate (ADR-0001). When the final weight shift is
+// pending (see isFinalWeightShiftPending), it holds the shift until every endpoint of the new
+// stable ReplicaSet is registered and healthy in the stable service's target groups. While held,
+// every reconciler keeps the recorded canary weight (the max weight) and the rollout is requeued
+// after the verify retry interval, with no timeout. Returns true when the shift is held.
+//
+// When target group verification does not apply (flag off, no ip mode TargetGroupBinding), the
+// gate does nothing and the final weight shift proceeds as before.
+func (c *rolloutContext) holdFinalWeightShift(reconcilers []trafficrouting.TrafficRoutingReconciler) (bool, error) {
+	if !c.isFinalWeightShiftPending(reconcilers) {
+		return false, nil
+	}
+	stableSvc, err := c.servicesLister.Services(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.Canary.StableService)
+	if err != nil {
+		return false, err
+	}
+	verdict, err := c.awsVerifyTargetGroupsHealthy(stableSvc, c.stableRS)
+	if err != nil {
+		// leave the current weights in place: the reconcile is retried
+		return true, err
+	}
+	if verdict != targetGroupVerdictNotReady {
+		return false, nil
+	}
+
+	canaryWeight := c.rollout.Status.Canary.Weights.Canary.Weight
+	c.log.Infof("Holding final weight shift for stable target group health: keeping canary weight %d", canaryWeight)
+	for _, reconciler := range reconcilers {
+		if err := reconciler.SetWeight(canaryWeight); err != nil {
+			c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: "TrafficRoutingError"}, err.Error())
+			return true, err
+		}
+	}
+	logCtx := logutil.WithRollout(c.rollout)
+	logCtx.Info("rollout enqueue due to promotion health gate")
+	c.enqueueRolloutAfter(c.rollout, defaults.GetRolloutVerifyRetryInterval())
+	return true, nil
 }
 
 // calculateDesiredWeightOnAbortOrStableRollback returns the desired weight to use when we are either
