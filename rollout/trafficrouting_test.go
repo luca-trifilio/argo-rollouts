@@ -2,6 +2,7 @@ package rollout
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -16,8 +17,11 @@ import (
 
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/apisix"
 
+	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -36,7 +40,10 @@ import (
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/traefik"
 	traefikMocks "github.com/argoproj/argo-rollouts/rollout/trafficrouting/traefik/mocks"
 	testutil "github.com/argoproj/argo-rollouts/test/util"
+	"github.com/argoproj/argo-rollouts/utils/aws"
+	awsmocks "github.com/argoproj/argo-rollouts/utils/aws/mocks"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
+	"github.com/argoproj/argo-rollouts/utils/defaults"
 	ingressutil "github.com/argoproj/argo-rollouts/utils/ingress"
 	istioutil "github.com/argoproj/argo-rollouts/utils/istio"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
@@ -2302,4 +2309,110 @@ func TestDynamicStableScaleNewCanarySupersedeShouldNotOverloadStable(t *testing.
 		"SetWeight should not be called when stable lacks capacity with dynamicStableScale; "+
 			"checkReplicasAvailable should return early. Calls observed: %v", setWeightCalls)
 	f.fakeTrafficRouting.AssertNotCalled(t, "UpdateHash", mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestCanaryALBPromotionHoldsFinalWeightShiftWhileStableTargetsInitial reproduces the promotion 503s
+// (upstream #4433): on the reconcile right after promotion, the selector switch has already moved the
+// stable service to the new pods, whose targets are registered in the stable target group but still
+// `initial`. The promotion health gate must hold the final weight shift until they are healthy (ADR-0001).
+func TestCanaryALBPromotionHoldsFinalWeightShiftWhileStableTargetsInitial(t *testing.T) {
+	defaults.SetVerifyTargetGroup(true)
+	defer defaults.SetVerifyTargetGroup(false)
+
+	fakeELB := awsmocks.ELBv2APIClient{}
+	aws.NewClient = aws.FakeNewClientFunc(&fakeELB)
+	defer func() {
+		aws.NewClient = aws.DefaultNewClientFunc
+	}()
+
+	f := newFixture(t)
+	defer f.Close()
+
+	// Every stable endpoint is registered in the stable target group, but none is healthy yet.
+	stableIPs := []string{"1.2.3.4", "5.6.7.8", "2.4.6.8"}
+	tgb := newTargetGroupBinding("stable")
+	ep := newEndpoints("stable", stableIPs...)
+	var targets []elbv2types.TargetHealthDescription
+	for _, ip := range stableIPs {
+		targets = append(targets, elbv2types.TargetHealthDescription{
+			Target:       &elbv2types.TargetDescription{Id: ptr.To[string](ip), Port: ptr.To[int32](80)},
+			TargetHealth: &elbv2types.TargetHealth{State: elbv2types.TargetHealthStateEnumInitial},
+		})
+	}
+	fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+		Return(&elbv2.DescribeTargetHealthOutput{TargetHealthDescriptions: targets}, nil)
+
+	steps := []v1alpha1.CanaryStep{{SetWeight: ptr.To[int32](10)}}
+	r1 := newCanaryRollout("foo", 3, nil, steps, ptr.To[int32](0), intstr.FromString("25%"), intstr.FromString("25%"))
+	r1.Spec.Strategy.Canary.TrafficRouting = &v1alpha1.RolloutTrafficRouting{
+		ALB: &v1alpha1.ALBTrafficRouting{
+			Ingress:     "ingress",
+			RootService: "root",
+		},
+	}
+	r1.Spec.Strategy.Canary.CanaryService = "canary"
+	r1.Spec.Strategy.Canary.StableService = "stable"
+	r2 := bumpVersion(r1)
+
+	rs1 := newReplicaSetWithStatus(r1, 3, 3)
+	rs2 := newReplicaSetWithStatus(r2, 3, 3)
+	rs1PodHash := rs1.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+	rs2PodHash := rs2.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+
+	// Selector switch done: both services already select rs2.
+	rootSvc := newService("root", 80, map[string]string{"app": "foo"}, nil)
+	canarySvc := newService("canary", 80, map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: rs2PodHash}, r2)
+	stableSvc := newService("stable", 80, map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: rs2PodHash}, r2)
+	ing := newIngress("ingress", canarySvc, stableSvc)
+
+	// Promoted at the end of the steps.
+	r2 = updateCanaryRolloutStatus(r2, rs2PodHash, 6, 3, 6, false)
+	r2.Status.Message = ""
+	r2.Status.ObservedGeneration = strconv.Itoa(int(r2.Generation))
+	r2.Status.StableRS = rs2PodHash
+	r2.Status.CurrentStepIndex = ptr.To[int32](int32(len(steps)))
+	availableCondition, _ := newAvailableCondition(true)
+	conditions.SetRolloutCondition(&r2.Status, availableCondition)
+	healthyCondition, _ := newHealthyCondition(false)
+	conditions.SetRolloutCondition(&r2.Status, healthyCondition)
+	progressingCondition, _ := newProgressingCondition(conditions.NewRSAvailableReason, rs2, "")
+	conditions.SetRolloutCondition(&r2.Status, progressingCondition)
+	completedCondition, _ := newCompletedCondition(true)
+	conditions.SetRolloutCondition(&r2.Status, completedCondition)
+	// Weights recorded by the previous reconcile: canary at max weight on rs2, stable at 0 on rs1.
+	r2.Status.Canary.Weights = &v1alpha1.TrafficWeights{
+		Canary: v1alpha1.WeightDestination{Weight: 100, ServiceName: "canary", PodTemplateHash: rs2PodHash},
+		Stable: v1alpha1.WeightDestination{Weight: 0, ServiceName: "stable", PodTemplateHash: rs1PodHash},
+	}
+
+	f.rolloutLister = append(f.rolloutLister, r2)
+	f.objects = append(f.objects, r2, tgb)
+	f.kubeobjects = append(f.kubeobjects, rs1, rs2, ing, rootSvc, canarySvc, stableSvc, ep)
+	f.serviceLister = append(f.serviceLister, rootSvc, canarySvc, stableSvc)
+	f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(ing))
+
+	var setWeightCalls []int32
+	f.fakeTrafficRouting = &mocks.TrafficRoutingReconciler{}
+	f.fakeTrafficRouting.On("Type").Return(alb.Type)
+	f.fakeTrafficRouting.On("UpdateHash", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	f.fakeTrafficRouting.On("SetWeight", mock.Anything, mock.Anything).Return(func(desiredWeight int32, additionalDestinations ...v1alpha1.WeightDestination) error {
+		setWeightCalls = append(setWeightCalls, desiredWeight)
+		return nil
+	})
+	f.fakeTrafficRouting.On("SetHeaderRoute", mock.Anything, mock.Anything).Return(nil)
+	f.fakeTrafficRouting.On("SetMirrorRoute", mock.Anything, mock.Anything).Return(nil)
+	f.fakeTrafficRouting.On("RemoveManagedRoutes", mock.Anything, mock.Anything).Return(nil)
+	f.fakeTrafficRouting.On("VerifyWeight", mock.Anything).Return(ptr.To[bool](true), nil)
+
+	f.expectGetEndpointsAction(ep)
+	f.expectPatchRolloutAction(r2)
+	f.run(getKey(r2, t))
+
+	ro, err := f.client.ArgoprojV1alpha1().Rollouts(metav1.NamespaceDefault).Get(context.Background(), "foo", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, setWeightCalls, int32(0),
+		"final weight shift applied while stable targets are initial; SetWeight calls: %v", setWeightCalls)
+	require.NotNil(t, ro.Status.Canary.Weights)
+	assert.Equal(t, rs1PodHash, ro.Status.Canary.Weights.Stable.PodTemplateHash,
+		"recorded stable weight moved off the previous stable ReplicaSet")
 }
