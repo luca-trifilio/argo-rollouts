@@ -150,13 +150,7 @@ func (c *rolloutContext) awsVerifyTargetGroups(svc *corev1.Service) error {
 
 	c.targetsVerified = ptr.To[bool](false)
 
-	// get endpoints of service
-	endpoints, err := c.kubeclientset.CoreV1().Endpoints(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-
-	awsClnt, err := aws.NewClient()
+	endpoints, awsClnt, err := c.getEndpointsAndAWSClient(ctx, svc)
 	if err != nil {
 		return err
 	}
@@ -182,6 +176,101 @@ func (c *rolloutContext) awsVerifyTargetGroups(svc *corev1.Service) error {
 	}
 	c.targetsVerified = ptr.To[bool](true)
 	return nil
+}
+
+// getEndpointsAndAWSClient returns the Endpoints of the Service and an AWS client, as needed by
+// target group verification.
+func (c *rolloutContext) getEndpointsAndAWSClient(ctx context.Context, svc *corev1.Service) (*corev1.Endpoints, aws.Client, error) {
+	endpoints, err := c.kubeclientset.CoreV1().Endpoints(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, nil, err
+	}
+	awsClnt, err := aws.NewClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	return endpoints, awsClnt, nil
+}
+
+// targetGroupVerdict is the outcome of the health-aware target group verification of a Service
+type targetGroupVerdict int
+
+const (
+	// targetGroupVerdictNotApplicable means there is nothing to verify: the
+	// --aws-verify-target-group flag is off, no TargetGroupBinding references the Service, no
+	// binding uses the ip target type, or no binding port matches a Service port
+	targetGroupVerdictNotApplicable targetGroupVerdict = iota
+	// targetGroupVerdictNotReady means at least one endpoint of the Service is not registered, or
+	// not healthy, in a target group bound to the Service (or the verification failed)
+	targetGroupVerdictNotReady
+	// targetGroupVerdictReady means every endpoint of the Service is registered and healthy in
+	// every applicable target group bound to the Service
+	targetGroupVerdictReady
+)
+
+// awsVerifyTargetGroupsHealthy is the health-aware mode of target group verification: it examines
+// a Service and returns whether every endpoint IP:port is registered and reports `healthy` in every
+// target group bound to the Service through an ip mode TargetGroupBinding.
+//
+// Unlike awsVerifyTargetGroups, it returns its verdict to the caller and never writes
+// c.targetsVerified, which the old ReplicaSet scale down reads with registration-only semantics.
+// It does not requeue the rollout either: that is the caller's decision. It also does not check
+// whether the rollout is at a point where verification makes sense (e.g. canary stableRS equal to
+// the new hash): that precondition is the caller's responsibility too.
+//
+// When not ready, it emits a TargetGroupUnverified Warning event naming the Service, the target
+// group and the "x/y endpoints healthy" count, and stops at the first such target group. The
+// unhealthy targets are logged. On error, it emits a TargetGroupVerifyError Warning event and
+// returns targetGroupVerdictNotReady with the error.
+func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service) (targetGroupVerdict, error) {
+	if !defaults.VerifyTargetGroup() {
+		// feature is disabled
+		return targetGroupVerdictNotApplicable, nil
+	}
+	logCtx := c.log.WithField(logutil.ServiceKey, svc.Name)
+
+	ctx := context.TODO()
+	// find all TargetGroupBindings in the namespace which reference the service name + port
+	allBindings, err := aws.GetTargetGroupBindingsByService(ctx, c.dynamicclientset, *svc)
+	if err != nil {
+		return targetGroupVerdictNotReady, err
+	}
+	var tgBindings []aws.TargetGroupBinding
+	for _, tgb := range allBindings {
+		if aws.IsTargetTypeIP(tgb) {
+			tgBindings = append(tgBindings, tgb)
+		}
+	}
+	if len(tgBindings) == 0 {
+		// no ip mode TargetGroupBinding for the service found. nothing to verify
+		return targetGroupVerdictNotApplicable, nil
+	}
+	logCtx.Infof("Verifying target group registration and health")
+
+	endpoints, awsClnt, err := c.getEndpointsAndAWSClient(ctx, svc)
+	if err != nil {
+		return targetGroupVerdictNotReady, err
+	}
+
+	verdict := targetGroupVerdictNotApplicable
+	for _, tgb := range tgBindings {
+		verifyRes, err := aws.VerifyTargetGroupBindingHealthy(ctx, c.log, awsClnt, tgb, endpoints, svc)
+		if err != nil {
+			c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: conditions.TargetGroupVerifyErrorReason}, conditions.TargetGroupVerifyErrorMessage, svc.Name, tgb.Spec.TargetGroupARN, err)
+			return targetGroupVerdictNotReady, err
+		}
+		if verifyRes == nil {
+			// verification not applicable (e.g. unmatched port)
+			continue
+		}
+		if !verifyRes.Verified {
+			c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: conditions.TargetGroupUnverifiedReason}, conditions.TargetGroupUnverifiedHealthMessage, svc.Name, tgb.Spec.TargetGroupARN, verifyRes.EndpointsHealthy, verifyRes.EndpointsTotal)
+			return targetGroupVerdictNotReady, nil
+		}
+		c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.TargetGroupVerifiedReason}, conditions.TargetGroupVerifiedHealthMessage, svc.Name, tgb.Spec.TargetGroupARN, verifyRes.EndpointsHealthy)
+		verdict = targetGroupVerdictReady
+	}
+	return verdict, nil
 }
 
 // shouldVerifyTargetGroup returns whether or not we should verify the target group
