@@ -2816,6 +2816,9 @@ func TestCanaryALBPromotionHealthGateNotApplicable(t *testing.T) {
 		g.rs2 = newReplicaSetWithStatus(g.ro, 0, 0)
 		g.stableSvc.Spec.Selector = map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: g.rs1PodHash()}
 		g.f.expectPatchServiceAction(g.canarySvc, g.rs1PodHash())
+		// normal abort scale down: rs1 (stable) is fully available, so the canary rs2 gets the
+		// abortScaleDownDelaySeconds scale-down-deadline annotation
+		g.f.expectPatchReplicaSetAction(g.rs2)
 
 		ro := g.run(0)
 
