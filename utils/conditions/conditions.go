@@ -172,9 +172,11 @@ const (
 	TargetGroupVerifiedReason              = "TargetGroupVerified"
 	TargetGroupVerifiedRegistrationMessage = "Service %s (TargetGroup %s) verified: %d endpoints registered"
 	TargetGroupVerifiedWeightsMessage      = "Service %s (TargetGroup %s) verified: canary weight %d set"
+	TargetGroupVerifiedHealthMessage       = "Service %s (TargetGroup %s) verified: %d endpoints healthy"
 	// TargetGroupHealthyReason is emitted when target group has not been verified
 	TargetGroupUnverifiedReason              = "TargetGroupUnverified"
 	TargetGroupUnverifiedRegistrationMessage = "Service %s (TargetGroup %s) not verified: %d/%d endpoints registered"
+	TargetGroupUnverifiedHealthMessage       = "Service %s (TargetGroup %s) not verified: %d/%d endpoints healthy"
 	TargetGroupUnverifiedWeightsMessage      = "Service %s (TargetGroup %s) not verified: canary weight %d not yet set (current: %d)"
 	// TargetGroupVerifyErrorReason is emitted when we fail to verify the health of a target group due to error
 	TargetGroupVerifyErrorReason  = "TargetGroupVerifyError"
