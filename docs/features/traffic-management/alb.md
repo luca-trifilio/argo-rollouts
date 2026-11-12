@@ -275,7 +275,7 @@ When TargetGroup verification is enabled, the controller holds the final weight 
 normal end-of-steps promotion: the canary service keeps 100% of the traffic, served by the same new
 pods, until every endpoint of the new stable ReplicaSet is registered **and** reports `healthy` in
 every TargetGroup bound to the stable service. Every other target health state (`initial`,
-`unhealthy`, `draining`, `unused`, `unavailable`) holds the shift. The shift is also held until the
+`unhealthy`, `unhealthy.draining`, `draining`, `unused`, `unavailable`) holds the shift. The shift is also held until the
 stable service's `Endpoints` list only the pods of the new ReplicaSet, which can lag a few moments
 behind the selector switch (`TargetGroupUnverified` Warning event
 `Service stable not verified: 0/3 endpoints are pods of ReplicaSet ...`). While held, the
