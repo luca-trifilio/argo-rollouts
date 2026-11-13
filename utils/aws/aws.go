@@ -276,17 +276,8 @@ func GetTargetGroupBindingsByService(ctx context.Context, dynamicClient dynamic.
 		if err != nil {
 			return nil, err
 		}
-		if tgb.Spec.ServiceRef.Name != svc.Name {
-			continue
-		}
-		for _, port := range svc.Spec.Ports {
-			if tgb.Spec.ServiceRef.Port.Type == intstr.Int && port.Port == tgb.Spec.ServiceRef.Port.IntVal {
-				tgbs = append(tgbs, *tgb)
-				break
-			} else if tgb.Spec.ServiceRef.Port.StrVal != "" && port.Name == tgb.Spec.ServiceRef.Port.StrVal {
-				tgbs = append(tgbs, *tgb)
-				break
-			}
+		if tgb.Spec.ServiceRef.Name == svc.Name && matchesServicePort(*tgb, svc) {
+			tgbs = append(tgbs, *tgb)
 		}
 	}
 	return tgbs, nil
@@ -339,10 +330,9 @@ func servicePortMatches(tgb TargetGroupBinding, svcPort corev1.ServicePort) bool
 	return servicePortName != "" && servicePortName == svcPort.Name
 }
 
-// MatchesServicePort returns whether the TargetGroupBinding's spec.serviceRef.port refers to one of
-// the Service's spec.ports, with the port matching rule of target group verification. Target group
-// verification is not applicable to a binding which matches no Service port.
-func MatchesServicePort(tgb TargetGroupBinding, svc corev1.Service) bool {
+// matchesServicePort returns whether the TargetGroupBinding's spec.serviceRef.port refers to one of
+// the Service's spec.ports. GetTargetGroupBindingsByService only returns such bindings.
+func matchesServicePort(tgb TargetGroupBinding, svc corev1.Service) bool {
 	for _, svcPort := range svc.Spec.Ports {
 		if servicePortMatches(tgb, svcPort) {
 			return true

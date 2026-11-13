@@ -2340,6 +2340,8 @@ type promotionHealthGateTest struct {
 	pods                          []*corev1.Pod
 	tgbs                          []*unstructured.Unstructured
 	routerType                    string
+	// statusUnchanged expects the reconcile to leave the status as it is, so no rollout patch
+	statusUnchanged bool
 
 	// set by run
 	setWeightCalls []int32
@@ -2479,7 +2481,7 @@ func (g *promotionHealthGateTest) reconcile(endpointsGets int, expectError bool)
 	for n := 0; n < endpointsGets; n++ {
 		f.expectGetEndpointsAction(g.endpoints)
 	}
-	if !expectError {
+	if !expectError && !g.statusUnchanged {
 		f.expectPatchRolloutAction(g.ro)
 	}
 
@@ -2544,12 +2546,45 @@ func TestCanaryALBPromotionHoldsFinalWeightShiftWhileStableTargetsInitial(t *tes
 	assert.Contains(t, g.events,
 		"Warning "+conditions.TargetGroupUnverifiedReason+" Service stable (TargetGroup arn::1234) not verified: 0/3 endpoints healthy")
 
-	// The old ReplicaSet is not scaled down while held, and stays referenced by the recorded
-	// stable weight, so the next reconciles keep it too.
+	// The old ReplicaSet is not scaled down while held. This reconcile reads the recorded weights
+	// it was given, so this alone does not show the hold keeps rs1 referenced: see
+	// TestCanaryALBPromotionHealthGateHoldsAcrossRequeue.
+	g.assertPreviousStableKept()
+}
+
+// assertPreviousStableKept asserts rs1 was neither scaled down nor given a scale down deadline
+func (g *promotionHealthGateTest) assertPreviousStableKept() {
+	t := g.t
+	t.Helper()
 	rs1, err := g.f.kubeclient.AppsV1().ReplicaSets(metav1.NamespaceDefault).Get(context.Background(), g.rs1.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	assert.Equal(t, int32(3), *rs1.Spec.Replicas)
 	assert.NotContains(t, rs1.Annotations, v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey)
+}
+
+// TestCanaryALBPromotionHealthGateHoldsAcrossRequeue reconciles the rollout a second time from the
+// status stored by a held reconcile, as on the requeue. The gate holds again, and the previous
+// stable ReplicaSet stays referenced by the recorded weights, so it is still not scaled down. Had
+// the held reconcile recorded the new stable ReplicaSet, this reconcile would schedule rs1 for scale
+// down.
+func TestCanaryALBPromotionHealthGateHoldsAcrossRequeue(t *testing.T) {
+	first := newPromotionHealthGateTest(t)
+	first.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+		Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, promotionHealthGateStableIPs...), nil)
+	held := first.run(2)
+	first.assertHeld(held)
+
+	g := newPromotionHealthGateTest(t)
+	// the requeue reads the status the held reconcile stored, and holding again changes nothing
+	g.ro.Status = *held.Status.DeepCopy()
+	g.statusUnchanged = true
+	g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+		Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, promotionHealthGateStableIPs...), nil)
+
+	ro := g.run(2)
+
+	g.assertHeld(ro)
+	g.assertPreviousStableKept()
 }
 
 // TestCanaryALBPromotionHealthGate covers the promotion health gate (ADR-0001) on the reconcile

@@ -247,10 +247,11 @@ func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service, rs *a
 		return targetGroupVerdictNotReady, err
 	}
 	// applicability is decided before the Endpoints are read, so that a Service with nothing to
-	// verify is never held by the stale Endpoints guard below
+	// verify is never held by the stale Endpoints guard below. The lookup only returns bindings
+	// whose port matches a Service port.
 	var tgBindings []aws.TargetGroupBinding
 	for _, tgb := range allBindings {
-		if aws.IsTargetTypeIP(tgb) && aws.MatchesServicePort(tgb, *svc) {
+		if aws.IsTargetTypeIP(tgb) {
 			tgBindings = append(tgBindings, tgb)
 		}
 	}

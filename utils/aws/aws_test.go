@@ -661,9 +661,9 @@ func TestMatchesServicePort(t *testing.T) {
 	tgbWithPort := func(port intstr.IntOrString) TargetGroupBinding {
 		return TargetGroupBinding{Spec: TargetGroupBindingSpec{ServiceRef: ServiceReference{Port: port}}}
 	}
-	assert.True(t, MatchesServicePort(tgbWithPort(intstr.FromInt(80)), svc))
-	assert.True(t, MatchesServicePort(tgbWithPort(intstr.FromString("http")), svc))
-	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromInt(8443)), svc))
-	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromString("https")), svc))
-	assert.False(t, MatchesServicePort(tgbWithPort(intstr.FromString("")), svc))
+	assert.True(t, matchesServicePort(tgbWithPort(intstr.FromInt(80)), svc))
+	assert.True(t, matchesServicePort(tgbWithPort(intstr.FromString("http")), svc))
+	assert.False(t, matchesServicePort(tgbWithPort(intstr.FromInt(8443)), svc))
+	assert.False(t, matchesServicePort(tgbWithPort(intstr.FromString("https")), svc))
+	assert.False(t, matchesServicePort(tgbWithPort(intstr.FromString("")), svc))
 }
