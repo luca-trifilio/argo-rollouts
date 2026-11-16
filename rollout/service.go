@@ -7,6 +7,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	patchtypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
@@ -150,13 +151,7 @@ func (c *rolloutContext) awsVerifyTargetGroups(svc *corev1.Service) error {
 
 	c.targetsVerified = ptr.To[bool](false)
 
-	// get endpoints of service
-	endpoints, err := c.kubeclientset.CoreV1().Endpoints(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-
-	awsClnt, err := aws.NewClient()
+	endpoints, awsClnt, err := c.getEndpointsAndAWSClient(ctx, svc)
 	if err != nil {
 		return err
 	}
@@ -182,6 +177,119 @@ func (c *rolloutContext) awsVerifyTargetGroups(svc *corev1.Service) error {
 	}
 	c.targetsVerified = ptr.To[bool](true)
 	return nil
+}
+
+func (c *rolloutContext) getEndpointsAndAWSClient(ctx context.Context, svc *corev1.Service) (*corev1.Endpoints, aws.Client, error) {
+	endpoints, err := c.kubeclientset.CoreV1().Endpoints(svc.Namespace).Get(ctx, svc.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, nil, err
+	}
+	awsClnt, err := aws.NewClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	return endpoints, awsClnt, nil
+}
+
+type targetGroupVerdict int
+
+const (
+	targetGroupVerdictNotApplicable targetGroupVerdict = iota
+	targetGroupVerdictNotReady
+	targetGroupVerdictReady
+)
+
+func (c *rolloutContext) awsVerifyTargetGroupsHealthy(svc *corev1.Service, rs *appsv1.ReplicaSet) (targetGroupVerdict, error) {
+	if !defaults.VerifyTargetGroup() {
+		return targetGroupVerdictNotApplicable, nil
+	}
+	logCtx := c.log.WithField(logutil.ServiceKey, svc.Name)
+
+	ctx := context.TODO()
+	allBindings, err := aws.GetTargetGroupBindingsByService(ctx, c.dynamicclientset, *svc)
+	if err != nil {
+		return targetGroupVerdictNotReady, err
+	}
+	var tgBindings []aws.TargetGroupBinding
+	for _, tgb := range allBindings {
+		if aws.IsTargetTypeIP(tgb) {
+			tgBindings = append(tgBindings, tgb)
+		}
+	}
+	if len(tgBindings) == 0 {
+		return targetGroupVerdictNotApplicable, nil
+	}
+	logCtx.Infof("Verifying target group registration and health")
+
+	endpoints, awsClnt, err := c.getEndpointsAndAWSClient(ctx, svc)
+	if err != nil {
+		return targetGroupVerdictNotReady, err
+	}
+	reflected, err := c.endpointsReflectReplicaSet(ctx, endpoints, rs)
+	if err != nil {
+		return targetGroupVerdictNotReady, err
+	}
+	if !reflected {
+		return targetGroupVerdictNotReady, nil
+	}
+
+	verdict := targetGroupVerdictNotApplicable
+	for _, tgb := range tgBindings {
+		verifyRes, err := aws.VerifyTargetGroupBindingHealthy(ctx, c.log, awsClnt, tgb, endpoints, svc)
+		if err != nil {
+			c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: conditions.TargetGroupVerifyErrorReason}, conditions.TargetGroupVerifyErrorMessage, svc.Name, tgb.Spec.TargetGroupARN, err)
+			return targetGroupVerdictNotReady, err
+		}
+		if verifyRes == nil {
+			continue
+		}
+		if !verifyRes.Verified {
+			c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: conditions.TargetGroupUnverifiedReason}, conditions.TargetGroupUnverifiedHealthMessage, svc.Name, tgb.Spec.TargetGroupARN, verifyRes.EndpointsHealthy, verifyRes.EndpointsTotal)
+			return targetGroupVerdictNotReady, nil
+		}
+		c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.TargetGroupVerifiedReason}, conditions.TargetGroupVerifiedHealthMessage, svc.Name, tgb.Spec.TargetGroupARN, verifyRes.EndpointsHealthy)
+		verdict = targetGroupVerdictReady
+	}
+	return verdict, nil
+}
+
+func (c *rolloutContext) endpointsReflectReplicaSet(ctx context.Context, endpoints *corev1.Endpoints, rs *appsv1.ReplicaSet) (bool, error) {
+	logCtx := c.log.WithField(logutil.ServiceKey, endpoints.Name)
+	podHash := replicasetutil.GetPodTemplateHash(rs)
+	if podHash == "" {
+		logCtx.Info("Endpoints not verified: no ReplicaSet to match them against")
+		return false, nil
+	}
+	pods, err := c.kubeclientset.CoreV1().Pods(endpoints.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set{v1alpha1.DefaultRolloutUniqueLabelKey: podHash}.String(),
+	})
+	if err != nil {
+		return false, err
+	}
+	rsPodIPs := make(map[string]bool)
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP != "" {
+			rsPodIPs[pod.Status.PodIP] = true
+		}
+		for _, podIP := range pod.Status.PodIPs {
+			rsPodIPs[podIP.IP] = true
+		}
+	}
+	total, ofRS := 0, 0
+	for _, subset := range endpoints.Subsets {
+		for _, addr := range subset.Addresses {
+			total++
+			if rsPodIPs[addr.IP] {
+				ofRS++
+			}
+		}
+	}
+	if total == 0 || ofRS < total {
+		c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: conditions.TargetGroupUnverifiedReason}, conditions.TargetGroupUnverifiedEndpointsMessage, endpoints.Name, ofRS, total, rs.Name)
+		logCtx.Infof("Endpoints do not reflect ReplicaSet '%s' yet: %d/%d endpoints are its pods", rs.Name, ofRS, total)
+		return false, nil
+	}
+	return true, nil
 }
 
 // shouldVerifyTargetGroup returns whether or not we should verify the target group

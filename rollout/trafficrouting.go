@@ -173,6 +173,11 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 	}
 
 	c.log.Infof("Found %d TrafficRouting Reconcilers", len(reconcilers))
+
+	if held, err := c.holdFinalWeightShift(reconcilers); held || err != nil {
+		return err
+	}
+
 	// iterate over the list of trafficReconcilers
 	for _, reconciler := range reconcilers {
 		c.log.Infof("Reconciling TrafficRouting with type '%s'", reconciler.Type())
@@ -353,6 +358,60 @@ func (c *rolloutContext) reconcileTrafficRouting() error {
 		}
 	}
 	return nil
+}
+
+func (c *rolloutContext) isFinalWeightShiftPending(reconcilers []trafficrouting.TrafficRoutingReconciler) bool {
+	if !rolloututil.IsFullyPromoted(c.rollout) || trafficrouting.IsPingPongEnabled(c.rollout) {
+		return false
+	}
+	hasALB := false
+	for _, reconciler := range reconcilers {
+		if reconciler.Type() == alb.Type {
+			hasALB = true
+			break
+		}
+	}
+	if !hasALB {
+		return false
+	}
+	weights := c.rollout.Status.Canary.Weights
+	stableHash := replicasetutil.GetPodTemplateHash(c.stableRS)
+	return weights != nil &&
+		stableHash != "" &&
+		weights.Stable.PodTemplateHash != "" &&
+		weights.Stable.PodTemplateHash != stableHash &&
+		weights.Canary.PodTemplateHash == stableHash &&
+		weights.Canary.Weight == weightutil.MaxTrafficWeight(c.rollout)
+}
+
+func (c *rolloutContext) holdFinalWeightShift(reconcilers []trafficrouting.TrafficRoutingReconciler) (bool, error) {
+	if !c.isFinalWeightShiftPending(reconcilers) {
+		return false, nil
+	}
+	stableSvc, err := c.servicesLister.Services(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.Canary.StableService)
+	if err != nil {
+		return false, err
+	}
+	verdict, err := c.awsVerifyTargetGroupsHealthy(stableSvc, c.stableRS)
+	if err != nil {
+		return true, err
+	}
+	if verdict != targetGroupVerdictNotReady {
+		return false, nil
+	}
+
+	canaryWeight := c.rollout.Status.Canary.Weights.Canary.Weight
+	c.log.Infof("Holding final weight shift for stable target group health: keeping canary weight %d", canaryWeight)
+	for _, reconciler := range reconcilers {
+		if err := reconciler.SetWeight(canaryWeight); err != nil {
+			c.recorder.Warnf(c.rollout, record.EventOptions{EventReason: "TrafficRoutingError"}, err.Error())
+			return true, err
+		}
+	}
+	logCtx := logutil.WithRollout(c.rollout)
+	logCtx.Info("rollout enqueue due to promotion health gate")
+	c.enqueueRolloutAfter(c.rollout, defaults.GetRolloutVerifyRetryInterval())
+	return true, nil
 }
 
 // calculateDesiredWeightOnAbortOrStableRollback returns the desired weight to use when we are either

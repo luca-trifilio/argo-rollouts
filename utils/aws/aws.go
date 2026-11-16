@@ -276,17 +276,8 @@ func GetTargetGroupBindingsByService(ctx context.Context, dynamicClient dynamic.
 		if err != nil {
 			return nil, err
 		}
-		if tgb.Spec.ServiceRef.Name != svc.Name {
-			continue
-		}
-		for _, port := range svc.Spec.Ports {
-			if tgb.Spec.ServiceRef.Port.Type == intstr.Int && port.Port == tgb.Spec.ServiceRef.Port.IntVal {
-				tgbs = append(tgbs, *tgb)
-				break
-			} else if tgb.Spec.ServiceRef.Port.StrVal != "" && port.Name == tgb.Spec.ServiceRef.Port.StrVal {
-				tgbs = append(tgbs, *tgb)
-				break
-			}
+		if tgb.Spec.ServiceRef.Name == svc.Name && matchesServicePort(*tgb, svc) {
+			tgbs = append(tgbs, *tgb)
 		}
 	}
 	return tgbs, nil
@@ -310,15 +301,8 @@ func toTargetGroupBinding(obj map[string]any) (*TargetGroupBinding, error) {
 // and/or the Service's targetPort is a string and not a number
 // Returns 0 if unable to find matching port in given service.
 func getNumericTargetPort(tgb TargetGroupBinding, svc corev1.Service, endpoints corev1.Endpoints) int32 {
-	var servicePortNum int32
-	var servicePortName string
-	if portInt := tgb.Spec.ServiceRef.Port.IntVal; portInt > 0 {
-		servicePortNum = portInt
-	} else {
-		servicePortName = tgb.Spec.ServiceRef.Port.String()
-	}
 	for _, svcPort := range svc.Spec.Ports {
-		if (servicePortName != "" && servicePortName == svcPort.Name) || (servicePortNum > 0 && servicePortNum == svcPort.Port) {
+		if servicePortMatches(tgb, svcPort) {
 			if targetPortNum := svcPort.TargetPort.IntVal; targetPortNum > 0 {
 				return targetPortNum
 			}
@@ -336,22 +320,49 @@ func getNumericTargetPort(tgb TargetGroupBinding, svc corev1.Service, endpoints 
 	return 0
 }
 
+func servicePortMatches(tgb TargetGroupBinding, svcPort corev1.ServicePort) bool {
+	if portInt := tgb.Spec.ServiceRef.Port.IntVal; portInt > 0 {
+		return portInt == svcPort.Port
+	}
+	servicePortName := tgb.Spec.ServiceRef.Port.String()
+	return servicePortName != "" && servicePortName == svcPort.Name
+}
+
+func matchesServicePort(tgb TargetGroupBinding, svc corev1.Service) bool {
+	for _, svcPort := range svc.Spec.Ports {
+		if servicePortMatches(tgb, svcPort) {
+			return true
+		}
+	}
+	return false
+}
+
 // TargetGroupVerifyResult returns metadata when a target group is verified.
 type TargetGroupVerifyResult struct {
 	Service             string
 	Verified            bool
 	EndpointsRegistered int
+	EndpointsHealthy    int
 	EndpointsTotal      int
+}
+
+func IsTargetTypeIP(tgb TargetGroupBinding) bool {
+	return tgb.Spec.TargetType != nil && *tgb.Spec.TargetType == TargetTypeIP
 }
 
 // VerifyTargetGroupBinding verifies if the underlying AWS TargetGroup has all Pod IPs and ports
 // from the given service (the K8s Endpoints list) registered to the TargetGroup.
-// NOTE: a previous version of this method used to additionally verify that all registered targets
-// were "healthy" (in addition to registered), but the health of registered targets is actually
-// irrelevant for our purposes of verifying the service label change was reflected in the LB.
 // Returns nil if the verification is not applicable (e.g. target type is not IP)
 func VerifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Client, tgb TargetGroupBinding, endpoints *corev1.Endpoints, svc *corev1.Service) (*TargetGroupVerifyResult, error) {
-	if tgb.Spec.TargetType == nil || *tgb.Spec.TargetType != TargetTypeIP {
+	return verifyTargetGroupBinding(ctx, logCtx, awsClnt, tgb, endpoints, svc, false)
+}
+
+func VerifyTargetGroupBindingHealthy(ctx context.Context, logCtx *log.Entry, awsClnt Client, tgb TargetGroupBinding, endpoints *corev1.Endpoints, svc *corev1.Service) (*TargetGroupVerifyResult, error) {
+	return verifyTargetGroupBinding(ctx, logCtx, awsClnt, tgb, endpoints, svc, true)
+}
+
+func verifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Client, tgb TargetGroupBinding, endpoints *corev1.Endpoints, svc *corev1.Service, requireHealthy bool) (*TargetGroupVerifyResult, error) {
+	if !IsTargetTypeIP(tgb) {
 		// We only need to verify target groups using AWS CNI (spec.targetType: ip)
 		return nil, nil
 	}
@@ -383,6 +394,8 @@ func VerifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Cl
 	var ignored []string
 	var verified []string
 	var unverified []string
+	var unhealthy []string
+	healthy := 0
 
 	// Iterate all registered targets in AWS TargetGroup. Mark all endpoint IPs which we see registered
 	for _, target := range targets {
@@ -398,15 +411,20 @@ func VerifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Cl
 			continue
 		}
 		// Verify we see the endpoint IP registered to the TargetGroup
-		// NOTE: we used to check health here, but health is not relevant for verifying service label change
 		endpointIPs[targetStr] = true
 		verified = append(verified, targetStr)
+		if target.TargetHealth != nil && target.TargetHealth.State == elbv2types.TargetHealthStateEnumHealthy {
+			healthy++
+		} else {
+			unhealthy = append(unhealthy, describeTargetHealth(targetStr, target.TargetHealth))
+		}
 	}
 
 	tgvr := TargetGroupVerifyResult{
 		Service:             svc.Name,
 		EndpointsTotal:      len(endpointIPs),
 		EndpointsRegistered: len(verified),
+		EndpointsHealthy:    healthy,
 	}
 
 	// Check if any of our desired endpoints are not yet registered
@@ -420,6 +438,21 @@ func VerifyTargetGroupBinding(ctx context.Context, logCtx *log.Entry, awsClnt Cl
 	logCtx.Infof("Verified targets: %s", strings.Join(verified, ", "))
 	logCtx.Infof("Unregistered targets: %s", strings.Join(unverified, ", "))
 
+	if requireHealthy {
+		logCtx.Infof("Unhealthy targets: %s", strings.Join(unhealthy, ", "))
+		tgvr.Verified = tgvr.EndpointsHealthy == tgvr.EndpointsTotal
+		return &tgvr, nil
+	}
 	tgvr.Verified = bool(tgvr.EndpointsRegistered == tgvr.EndpointsTotal)
 	return &tgvr, nil
+}
+
+func describeTargetHealth(targetStr string, health *elbv2types.TargetHealth) string {
+	if health == nil {
+		return fmt.Sprintf("%s (unknown)", targetStr)
+	}
+	if health.Reason == "" {
+		return fmt.Sprintf("%s (%s)", targetStr, health.State)
+	}
+	return fmt.Sprintf("%s (%s: %s)", targetStr, health.State, health.Reason)
 }

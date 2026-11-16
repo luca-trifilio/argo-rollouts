@@ -261,6 +261,41 @@ point to the new ReplicaSet, the TargetGroup IP verification feature allows the 
 the scale down of the old ReplicaSet until it verifies the Pods IP behind the stableService
 TargetGroup are accurate.
 
+##### Promotion health gate (canary)
+
+At the end of the canary steps, promotion switches the `canary.stableService` selector to the new
+ReplicaSet, then returns all traffic to the stable service. The new Pod IPs join the stable
+TargetGroup in the `initial` health state: health checks run per TargetGroup, so being healthy in
+the canary TargetGroup does not carry over. Shifting traffic before they pass makes the ALB return
+HTTP 503s.
+
+When TargetGroup verification is enabled, the controller holds that final weight shift, keeping
+100% of the traffic on the canary service, until every pod of the new stable ReplicaSet is
+registered and `healthy` in every TargetGroup bound to the stable service. While it holds, it emits
+`TargetGroupUnverified` Warning events and checks again after the verify retry interval. The
+previous stable ReplicaSet is not scaled down until the shift happens.
+
+The gate requires the `--aws-verify-target-group` flag, a `TargetGroupBinding` with
+`targetType: ip` for the stable service, and the `elasticloadbalancing:DescribeTargetHealth`
+permission (see Usage below). Without them, or with ping-pong, the final weight shift happens right
+after the selector switch, as before.
+
+!!! warning
+
+    The gate has no timeout. If the stable TargetGroup never becomes healthy (for example, a wrong
+    health check path or a security group blocking the health checks), the rollout keeps 100% of
+    the traffic on the canary service until the TargetGroup is fixed. The rollout is not marked
+    Degraded: watch the `TargetGroupUnverified` events and the controller logs.
+
+The gate only applies when the canary is at the max weight at promotion. These cases can still
+return 503s:
+
+- full promotion (`kubectl argo rollouts promote --full`), when the canary is below the max weight;
+- rollouts with no steps;
+- fast rollback to a previous ReplicaSet;
+- the first `setWeight` step at the start of an update, when the new pods join the canary
+  TargetGroup.
+
 #### TargetGroup Weight Verification
 
 !!! note

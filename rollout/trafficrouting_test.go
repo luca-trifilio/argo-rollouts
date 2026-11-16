@@ -2,6 +2,7 @@ package rollout
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -16,8 +17,14 @@ import (
 
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/apisix"
 
+	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	elbv2types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/dynamic/dynamicinformer"
@@ -36,7 +43,10 @@ import (
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/traefik"
 	traefikMocks "github.com/argoproj/argo-rollouts/rollout/trafficrouting/traefik/mocks"
 	testutil "github.com/argoproj/argo-rollouts/test/util"
+	"github.com/argoproj/argo-rollouts/utils/aws"
+	awsmocks "github.com/argoproj/argo-rollouts/utils/aws/mocks"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
+	"github.com/argoproj/argo-rollouts/utils/defaults"
 	ingressutil "github.com/argoproj/argo-rollouts/utils/ingress"
 	istioutil "github.com/argoproj/argo-rollouts/utils/istio"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
@@ -2302,4 +2312,483 @@ func TestDynamicStableScaleNewCanarySupersedeShouldNotOverloadStable(t *testing.
 		"SetWeight should not be called when stable lacks capacity with dynamicStableScale; "+
 			"checkReplicasAvailable should return early. Calls observed: %v", setWeightCalls)
 	f.fakeTrafficRouting.AssertNotCalled(t, "UpdateHash", mock.Anything, mock.Anything, mock.Anything)
+}
+
+var promotionHealthGateStableIPs = []string{"1.2.3.4", "5.6.7.8", "2.4.6.8"}
+
+type promotionHealthGateTest struct {
+	t       *testing.T
+	f       *fixture
+	fakeELB *awsmocks.ELBv2APIClient
+
+	ro                            *v1alpha1.Rollout
+	rs1, rs2                      *appsv1.ReplicaSet
+	rootSvc, canarySvc, stableSvc *corev1.Service
+	ingress                       *extensionsv1beta1.Ingress
+	endpoints                     *corev1.Endpoints
+	pods                          []*corev1.Pod
+	tgbs                          []*unstructured.Unstructured
+	routerType                    string
+	statusUnchanged               bool
+
+	setWeightCalls []int32
+	requeues       []time.Duration
+	events         []string
+}
+
+func newPromotionHealthGateTest(t *testing.T) *promotionHealthGateTest {
+	t.Helper()
+	defaults.SetVerifyTargetGroup(true)
+	t.Cleanup(func() { defaults.SetVerifyTargetGroup(false) })
+	fakeELB := &awsmocks.ELBv2APIClient{}
+	aws.NewClient = aws.FakeNewClientFunc(fakeELB)
+	t.Cleanup(func() { aws.NewClient = aws.DefaultNewClientFunc })
+
+	f := newFixture(t)
+	t.Cleanup(f.Close)
+
+	steps := []v1alpha1.CanaryStep{{SetWeight: ptr.To[int32](10)}}
+	r1 := newCanaryRollout("foo", 3, nil, steps, ptr.To[int32](0), intstr.FromString("25%"), intstr.FromString("25%"))
+	r1.Spec.Strategy.Canary.TrafficRouting = &v1alpha1.RolloutTrafficRouting{
+		ALB: &v1alpha1.ALBTrafficRouting{
+			Ingress:     "ingress",
+			RootService: "root",
+		},
+	}
+	r1.Spec.Strategy.Canary.CanaryService = "canary"
+	r1.Spec.Strategy.Canary.StableService = "stable"
+	r2 := bumpVersion(r1)
+
+	rs1 := newReplicaSetWithStatus(r1, 3, 3)
+	rs2 := newReplicaSetWithStatus(r2, 3, 3)
+	rs1PodHash := rs1.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+	rs2PodHash := rs2.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+
+	rootSvc := newService("root", 80, map[string]string{"app": "foo"}, nil)
+	canarySvc := newService("canary", 80, map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: rs2PodHash}, r2)
+	stableSvc := newService("stable", 80, map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: rs2PodHash}, r2)
+	ing := newIngress("ingress", canarySvc, stableSvc)
+
+	r2 = updateCanaryRolloutStatus(r2, rs2PodHash, 6, 3, 6, false)
+	r2.Status.Message = ""
+	r2.Status.ObservedGeneration = strconv.Itoa(int(r2.Generation))
+	r2.Status.StableRS = rs2PodHash
+	r2.Status.CurrentStepIndex = ptr.To[int32](int32(len(steps)))
+	availableCondition, _ := newAvailableCondition(true)
+	conditions.SetRolloutCondition(&r2.Status, availableCondition)
+	healthyCondition, _ := newHealthyCondition(false)
+	conditions.SetRolloutCondition(&r2.Status, healthyCondition)
+	progressingCondition, _ := newProgressingCondition(conditions.NewRSAvailableReason, rs2, "")
+	conditions.SetRolloutCondition(&r2.Status, progressingCondition)
+	completedCondition, _ := newCompletedCondition(true)
+	conditions.SetRolloutCondition(&r2.Status, completedCondition)
+	r2.Status.Canary.Weights = &v1alpha1.TrafficWeights{
+		Canary: v1alpha1.WeightDestination{Weight: 100, ServiceName: "canary", PodTemplateHash: rs2PodHash},
+		Stable: v1alpha1.WeightDestination{Weight: 0, ServiceName: "stable", PodTemplateHash: rs1PodHash},
+	}
+
+	return &promotionHealthGateTest{
+		t:          t,
+		f:          f,
+		fakeELB:    fakeELB,
+		ro:         r2,
+		rs1:        rs1,
+		rs2:        rs2,
+		rootSvc:    rootSvc,
+		canarySvc:  canarySvc,
+		stableSvc:  stableSvc,
+		ingress:    ing,
+		endpoints:  newEndpoints("stable", promotionHealthGateStableIPs...),
+		pods:       newPodsForReplicaSet(rs2, promotionHealthGateStableIPs...),
+		tgbs:       []*unstructured.Unstructured{newTargetGroupBinding("stable")},
+		routerType: alb.Type,
+	}
+}
+
+func (g *promotionHealthGateTest) rs1PodHash() string {
+	return g.rs1.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+}
+
+func (g *promotionHealthGateTest) rs2PodHash() string {
+	return g.rs2.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
+}
+
+func (g *promotionHealthGateTest) scaleDownPreviousStable() {
+	g.rs1.Spec.Replicas = ptr.To[int32](0)
+	g.rs1.Status.Replicas = 0
+	g.rs1.Status.AvailableReplicas = 0
+	g.rs1.Status.ReadyReplicas = 0
+}
+
+func (g *promotionHealthGateTest) run(endpointsGets int) *v1alpha1.Rollout {
+	g.t.Helper()
+	return g.reconcile(endpointsGets, false)
+}
+
+func (g *promotionHealthGateTest) reconcile(endpointsGets int, expectError bool) *v1alpha1.Rollout {
+	g.t.Helper()
+	f := g.f
+	f.rolloutLister = append(f.rolloutLister, g.ro)
+	f.objects = append(f.objects, g.ro)
+	for _, tgb := range g.tgbs {
+		f.objects = append(f.objects, tgb)
+	}
+	if g.rs1 != nil {
+		f.kubeobjects = append(f.kubeobjects, g.rs1)
+	}
+	f.kubeobjects = append(f.kubeobjects, g.rs2, g.ingress, g.rootSvc, g.canarySvc, g.stableSvc, g.endpoints)
+	for _, pod := range g.pods {
+		f.kubeobjects = append(f.kubeobjects, pod)
+	}
+	f.serviceLister = append(f.serviceLister, g.rootSvc, g.canarySvc, g.stableSvc)
+	f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(g.ingress))
+
+	f.fakeTrafficRouting = &mocks.TrafficRoutingReconciler{}
+	f.fakeTrafficRouting.On("Type").Return(g.routerType)
+	f.fakeTrafficRouting.On("UpdateHash", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	f.fakeTrafficRouting.On("SetWeight", mock.Anything, mock.Anything).Return(func(desiredWeight int32, additionalDestinations ...v1alpha1.WeightDestination) error {
+		g.setWeightCalls = append(g.setWeightCalls, desiredWeight)
+		return nil
+	})
+	f.fakeTrafficRouting.On("SetHeaderRoute", mock.Anything, mock.Anything).Return(nil)
+	f.fakeTrafficRouting.On("SetMirrorRoute", mock.Anything, mock.Anything).Return(nil)
+	f.fakeTrafficRouting.On("RemoveManagedRoutes", mock.Anything, mock.Anything).Return(nil)
+	f.fakeTrafficRouting.On("VerifyWeight", mock.Anything).Return(ptr.To[bool](true), nil)
+
+	for n := 0; n < endpointsGets; n++ {
+		f.expectGetEndpointsAction(g.endpoints)
+	}
+	if !expectError && !g.statusUnchanged {
+		f.expectPatchRolloutAction(g.ro)
+	}
+
+	c, i, k8sI := f.newController(noResyncPeriodFunc)
+	c.enqueueRolloutAfter = func(obj any, duration time.Duration) {
+		g.requeues = append(g.requeues, duration)
+	}
+	f.runController(getKey(g.ro, g.t), true, expectError, c, i, k8sI)
+	g.events = fakeRecorderEventMessages(c.recorder)
+
+	ro, err := f.client.ArgoprojV1alpha1().Rollouts(metav1.NamespaceDefault).Get(context.Background(), g.ro.Name, metav1.GetOptions{})
+	require.NoError(g.t, err)
+	return ro
+}
+
+func (g *promotionHealthGateTest) assertHeld(ro *v1alpha1.Rollout) {
+	t := g.t
+	t.Helper()
+	assert.Equal(t, []int32{100}, g.setWeightCalls, "router did not keep the recorded max canary weight")
+	g.f.fakeTrafficRouting.AssertNotCalled(t, "UpdateHash", mock.Anything, mock.Anything, mock.Anything)
+	require.NotNil(t, ro.Status.Canary.Weights)
+	assert.Equal(t, int32(100), ro.Status.Canary.Weights.Canary.Weight)
+	assert.Equal(t, g.rs1PodHash(), ro.Status.Canary.Weights.Stable.PodTemplateHash,
+		"recorded stable weight moved off the previous stable ReplicaSet")
+	assert.Contains(t, g.requeues, defaults.GetRolloutVerifyRetryInterval())
+	assert.Empty(t, ro.Status.Message)
+	for _, cond := range ro.Status.Conditions {
+		assert.NotContains(t, []string{conditions.TargetGroupUnverifiedReason, conditions.TargetGroupVerifyErrorReason}, cond.Reason)
+	}
+}
+
+func (g *promotionHealthGateTest) assertFinalWeightShift(ro *v1alpha1.Rollout) {
+	t := g.t
+	t.Helper()
+	assert.Equal(t, []int32{0}, g.setWeightCalls, "final weight shift not applied")
+	require.NotNil(t, ro.Status.Canary.Weights)
+	assert.Equal(t, int32(0), ro.Status.Canary.Weights.Canary.Weight)
+	assert.Equal(t, int32(100), ro.Status.Canary.Weights.Stable.Weight)
+	assert.Equal(t, g.rs2PodHash(), ro.Status.Canary.Weights.Stable.PodTemplateHash)
+}
+
+func TestCanaryALBPromotionHoldsFinalWeightShiftWhileStableTargetsInitial(t *testing.T) {
+	g := newPromotionHealthGateTest(t)
+	g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+		Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, promotionHealthGateStableIPs...), nil)
+
+	ro := g.run(2)
+
+	assert.NotContains(t, g.setWeightCalls, int32(0),
+		"final weight shift applied while stable targets are initial; SetWeight calls: %v", g.setWeightCalls)
+	g.assertHeld(ro)
+	assert.Contains(t, g.events,
+		"Warning "+conditions.TargetGroupUnverifiedReason+" Service stable (TargetGroup arn::1234) not verified: 0/3 endpoints healthy")
+
+	g.assertPreviousStableKept()
+}
+
+func (g *promotionHealthGateTest) assertPreviousStableKept() {
+	t := g.t
+	t.Helper()
+	rs1, err := g.f.kubeclient.AppsV1().ReplicaSets(metav1.NamespaceDefault).Get(context.Background(), g.rs1.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), *rs1.Spec.Replicas)
+	assert.NotContains(t, rs1.Annotations, v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey)
+}
+
+func TestCanaryALBPromotionHealthGateHoldsAcrossRequeue(t *testing.T) {
+	first := newPromotionHealthGateTest(t)
+	first.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+		Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, promotionHealthGateStableIPs...), nil)
+	held := first.run(2)
+	first.assertHeld(held)
+
+	g := newPromotionHealthGateTest(t)
+	g.ro.Status = *held.Status.DeepCopy()
+	g.statusUnchanged = true
+	g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+		Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, promotionHealthGateStableIPs...), nil)
+
+	ro := g.run(2)
+
+	g.assertHeld(ro)
+	g.assertPreviousStableKept()
+}
+
+func TestCanaryALBPromotionHealthGate(t *testing.T) {
+	t.Run("AppliedOnceStableTargetsHealthy", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+			Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, promotionHealthGateStableIPs...), nil)
+
+		ro := g.run(2)
+
+		g.assertFinalWeightShift(ro)
+		assert.Contains(t, g.events,
+			"Normal "+conditions.TargetGroupVerifiedReason+" Service stable (TargetGroup arn::1234) verified: 3 endpoints healthy")
+	})
+
+	t.Run("NotEvaluatedAgainAfterFinalWeightShift", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		g.scaleDownPreviousStable()
+		g.ro.Status.Canary.Weights = &v1alpha1.TrafficWeights{
+			Canary: v1alpha1.WeightDestination{Weight: 0, ServiceName: "canary", PodTemplateHash: g.rs2PodHash()},
+			Stable: v1alpha1.WeightDestination{Weight: 100, ServiceName: "stable", PodTemplateHash: g.rs2PodHash()},
+		}
+
+		ro := g.run(0)
+
+		g.assertFinalWeightShift(ro)
+		g.fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
+	})
+
+	t.Run("HeldWhileSomeStableTargetsUnregistered", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+			Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, "1.2.3.4", "5.6.7.8"), nil)
+
+		ro := g.run(2)
+
+		g.assertHeld(ro)
+		assert.Contains(t, g.events,
+			"Warning "+conditions.TargetGroupUnverifiedReason+" Service stable (TargetGroup arn::1234) not verified: 2/3 endpoints healthy")
+	})
+
+	t.Run("HeldWhileOneOfTwoTargetGroupBindingsUnhealthy", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		g.tgbs = []*unstructured.Unstructured{
+			newTargetGroupBindingFor("stable-a", "stable", "arn::healthy", "ip"),
+			newTargetGroupBindingFor("stable-b", "stable", "arn::initial", "ip"),
+		}
+		g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.MatchedBy(func(in *elbv2.DescribeTargetHealthInput) bool {
+			return *in.TargetGroupArn == "arn::healthy"
+		})).Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, promotionHealthGateStableIPs...), nil)
+		g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.MatchedBy(func(in *elbv2.DescribeTargetHealthInput) bool {
+			return *in.TargetGroupArn == "arn::initial"
+		})).Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumInitial, promotionHealthGateStableIPs...), nil)
+
+		ro := g.run(2)
+
+		g.assertHeld(ro)
+		assert.Contains(t, g.events,
+			"Warning "+conditions.TargetGroupUnverifiedReason+" Service stable (TargetGroup arn::initial) not verified: 0/3 endpoints healthy")
+	})
+
+	t.Run("VerifyErrorLeavesWeightsAndFailsReconcile", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).Return(nil, errors.New("boom"))
+
+		ro := g.reconcile(1, true)
+
+		assert.Empty(t, g.setWeightCalls)
+		require.NotNil(t, ro.Status.Canary.Weights)
+		assert.Equal(t, g.rs1PodHash(), ro.Status.Canary.Weights.Stable.PodTemplateHash)
+		assert.Contains(t, g.events,
+			"Warning "+conditions.TargetGroupVerifyErrorReason+" Failed to verify Service stable (TargetGroup arn::1234): boom")
+	})
+}
+
+func TestCanaryALBPromotionHealthGateHoldsOnStaleEndpoints(t *testing.T) {
+	oldIPs := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+
+	t.Run("EndpointsStillListPreviousStablePods", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		g.endpoints = newEndpoints("stable", oldIPs...)
+		g.pods = append(g.pods, newPodsForReplicaSet(g.rs1, oldIPs...)...)
+		g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+			Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, oldIPs...), nil)
+
+		ro := g.run(2)
+
+		g.assertHeld(ro)
+		g.fakeELB.AssertNumberOfCalls(t, "DescribeTargetHealth", 1)
+		assert.Contains(t, g.events,
+			"Warning "+conditions.TargetGroupUnverifiedReason+" Service stable not verified: 0/3 endpoints are pods of ReplicaSet "+g.rs2.Name)
+	})
+
+	t.Run("EndpointsListPreviousAndNewStablePods", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		ips := append([]string{oldIPs[0]}, promotionHealthGateStableIPs...)
+		g.endpoints = newEndpoints("stable", ips...)
+		g.pods = append(g.pods, newPodsForReplicaSet(g.rs1, oldIPs[0])...)
+		g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+			Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, ips...), nil)
+
+		ro := g.run(2)
+
+		g.assertHeld(ro)
+		g.fakeELB.AssertNumberOfCalls(t, "DescribeTargetHealth", 1)
+		assert.Contains(t, g.events,
+			"Warning "+conditions.TargetGroupUnverifiedReason+" Service stable not verified: 3/4 endpoints are pods of ReplicaSet "+g.rs2.Name)
+	})
+
+	t.Run("NoEndpoints", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		g.endpoints = newEndpoints("stable")
+		g.fakeELB.On("DescribeTargetHealth", mock.Anything, mock.Anything).
+			Return(newTargetHealthOutput(elbv2types.TargetHealthStateEnumHealthy, oldIPs...), nil)
+
+		ro := g.run(2)
+
+		g.assertHeld(ro)
+		g.fakeELB.AssertNumberOfCalls(t, "DescribeTargetHealth", 1)
+		assert.Contains(t, g.events,
+			"Warning "+conditions.TargetGroupUnverifiedReason+" Service stable not verified: 0/0 endpoints are pods of ReplicaSet "+g.rs2.Name)
+	})
+}
+
+func TestCanaryALBPromotionHealthGateNotApplicable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(g *promotionHealthGateTest)
+	}{
+		{
+			name:  "FlagOff",
+			setup: func(g *promotionHealthGateTest) { defaults.SetVerifyTargetGroup(false) },
+		},
+		{
+			name:  "NoTargetGroupBinding",
+			setup: func(g *promotionHealthGateTest) { g.tgbs = nil },
+		},
+		{
+			name: "InstanceTargetType",
+			setup: func(g *promotionHealthGateTest) {
+				g.tgbs = []*unstructured.Unstructured{newTargetGroupBindingFor("stable", "stable", "arn::1234", "instance")}
+			},
+		},
+		{
+			name: "PingPong",
+			setup: func(g *promotionHealthGateTest) {
+				g.ro.Spec.Strategy.Canary.PingPong = &v1alpha1.PingPongSpec{PingService: "stable", PongService: "canary"}
+				g.ro.Status.Canary.StablePingPong = v1alpha1.PPPing
+			},
+		},
+		{
+			name:  "NonALBRouter",
+			setup: func(g *promotionHealthGateTest) { g.routerType = "fake" },
+		},
+		{
+			name: "FullPromotionBelowMaxWeight",
+			setup: func(g *promotionHealthGateTest) {
+				g.ro.Status.Canary.Weights.Canary.Weight = 10
+				g.ro.Status.Canary.Weights.Stable.Weight = 90
+			},
+		},
+		{
+			name: "NoSteps",
+			setup: func(g *promotionHealthGateTest) {
+				g.ro.Spec.Strategy.Canary.Steps = nil
+				g.ro.Status.CurrentStepHash = conditions.ComputeStepHash(g.ro)
+				g.ro.Status.CurrentStepIndex = nil
+				g.ro.Status.Canary.Weights.Canary.Weight = 0
+				g.ro.Status.Canary.Weights.Stable.Weight = 100
+			},
+		},
+		{
+			name: "RecordedCanaryHashNotNewStable",
+			setup: func(g *promotionHealthGateTest) {
+				g.ro.Status.Canary.Weights.Canary.PodTemplateHash = "otherhash"
+			},
+		},
+		{
+			name: "DynamicRollbackToStable",
+			setup: func(g *promotionHealthGateTest) {
+				g.ro.Status.Canary.Weights.Canary.PodTemplateHash = g.rs1PodHash()
+				g.ro.Status.Canary.Weights.Stable.PodTemplateHash = g.rs2PodHash()
+			},
+		},
+		{
+			name: "UnmatchedPortWithStaleEndpoints",
+			setup: func(g *promotionHealthGateTest) {
+				g.tgbs = []*unstructured.Unstructured{newUnmatchedPortTargetGroupBinding(g.t, "stable")}
+				g.endpoints = newEndpoints("stable", "10.0.0.1", "10.0.0.2", "10.0.0.3")
+				g.pods = append(g.pods, newPodsForReplicaSet(g.rs1, "10.0.0.1", "10.0.0.2", "10.0.0.3")...)
+			},
+		},
+		{
+			name: "UnmatchedPortWithEmptyEndpoints",
+			setup: func(g *promotionHealthGateTest) {
+				g.tgbs = []*unstructured.Unstructured{newUnmatchedPortTargetGroupBinding(g.t, "stable")}
+				g.endpoints = newEndpoints("stable")
+			},
+		},
+		{
+			name:  "NilRecordedWeights",
+			setup: func(g *promotionHealthGateTest) { g.ro.Status.Canary.Weights = nil },
+		},
+		{
+			name:  "EmptyRecordedStableHash",
+			setup: func(g *promotionHealthGateTest) { g.ro.Status.Canary.Weights.Stable.PodTemplateHash = "" },
+		},
+		{
+			name: "InitialDeploy",
+			setup: func(g *promotionHealthGateTest) {
+				g.rs1 = nil
+				g.ro.Status.Canary.Weights = nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newPromotionHealthGateTest(t)
+			g.scaleDownPreviousStable()
+			tc.setup(g)
+
+			ro := g.run(0)
+
+			g.assertFinalWeightShift(ro)
+			g.fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
+			for _, event := range g.events {
+				assert.NotContains(t, event, conditions.TargetGroupUnverifiedReason)
+				assert.NotContains(t, event, conditions.TargetGroupVerifyErrorReason)
+			}
+		})
+	}
+
+	t.Run("Abort", func(t *testing.T) {
+		g := newPromotionHealthGateTest(t)
+		g.ro.Status.StableRS = g.rs1PodHash()
+		g.ro.Status.Abort = true
+		g.ro.Status.AbortedAt = &metav1.Time{Time: time.Now().Add(-1 * time.Minute)}
+		g.rs2 = newReplicaSetWithStatus(g.ro, 0, 0)
+		g.stableSvc.Spec.Selector = map[string]string{v1alpha1.DefaultRolloutUniqueLabelKey: g.rs1PodHash()}
+		g.f.expectPatchServiceAction(g.canarySvc, g.rs1PodHash())
+		g.f.expectPatchReplicaSetAction(g.rs2)
+
+		ro := g.run(0)
+
+		assert.Contains(t, g.setWeightCalls, int32(0))
+		assert.NotContains(t, g.setWeightCalls, int32(100))
+		require.NotNil(t, ro.Status.Canary.Weights)
+		assert.Equal(t, int32(0), ro.Status.Canary.Weights.Canary.Weight)
+		g.fakeELB.AssertNotCalled(t, "DescribeTargetHealth", mock.Anything, mock.Anything)
+	})
 }
